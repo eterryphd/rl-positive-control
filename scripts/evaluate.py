@@ -2,103 +2,178 @@
 """
 Evaluate model on arithmetic test set.
 
+Saves full prompt and response for each problem for reproducibility.
+
 Usage:
     # Evaluate base model
     python evaluate.py --model meta-llama/Llama-3.2-3B-Instruct
     
     # Evaluate trained checkpoint
-    python evaluate.py --checkpoint checkpoints/best_model.pt
+    python evaluate.py --checkpoint checkpoints/step_1000.pt
+
+Manual validation (paste into HuggingFace chat):
+    System message: You are a calculator. Output only the number.
+    User message: 35 + 17 - 8
+    Expected output: 44
+
+Actual prompt after chat template (for debugging):
+    <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+    You are a calculator. Output only the number.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+    35 + 17 - 8<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 """
 
 import argparse
 import json
 import re
 import torch
+from datetime import datetime
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
-def extract_answer(response):
-    """Extract numeric answer from model response."""
-    # Try to find numbers (including decimals and negatives)
-    numbers = re.findall(r'-?\d+\.?\d*', response)
+# ============================================================================
+# CONFIG - User configurable settings
+# ============================================================================
+
+CONFIG = {
+    # Prompt configuration
+    'system_message': "You are a calculator. Output only the number.",
+    'max_new_tokens': 150,
     
+    # Paths
+    'data_dir': 'data',
+    'results_dir': 'results',
+    
+    # Answer extraction
+    'tolerance': 0.01,  # For floating point comparison
+}
+
+
+# Expose for imports
+SYSTEM_MESSAGE = CONFIG['system_message']
+MAX_NEW_TOKENS = CONFIG['max_new_tokens']
+
+
+def build_prompt(problem: str, tokenizer) -> tuple[str, int]:
+    """
+    Build chat-formatted prompt and return (prompt_string, input_token_count).
+    """
+    messages = [
+        {"role": "system", "content": SYSTEM_MESSAGE},
+        {"role": "user", "content": problem}
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages, 
+        tokenize=False, 
+        add_generation_prompt=True
+    )
+    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
+    return prompt, input_ids.shape[1]
+
+
+def extract_answer(response: str):
+    """Extract numeric answer from model response."""
+    # Find all numbers (including negative and decimal)
+    numbers = re.findall(r'-?\d+\.?\d*', response)
     if numbers:
         try:
-            return float(numbers[-1])  # Take last number
+            return float(numbers[0])  # Take first number
         except ValueError:
             return None
     return None
 
-def evaluate_single(model, tokenizer, problem, device='cuda'):
+
+def evaluate_single(model, tokenizer, problem: dict, device: str) -> dict:
     """Evaluate model on single problem."""
-    prompt = f"Solve this arithmetic problem: {problem['problem']}\nAnswer:"
+    prompt, input_length = build_prompt(problem['problem'], tokenizer)
     
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=100,
-            do_sample=False,  # Deterministic
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
             pad_token_id=tokenizer.eos_token_id
         )
     
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    # Remove the prompt from response
-    response = response[len(prompt):].strip()
+    # Extract only the generated tokens
+    generated_ids = outputs[0][input_length:]
+    response = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
     
     predicted = extract_answer(response)
     correct_answer = problem['answer']
-    
-    # Check if close enough (within 0.01 for floating point)
-    if predicted is not None and correct_answer is not None:
-        is_correct = abs(predicted - correct_answer) < 0.01
-    else:
-        is_correct = False
+    is_correct = (
+        predicted is not None and 
+        abs(predicted - correct_answer) < CONFIG['tolerance']
+    )
     
     return {
         'problem': problem['problem'],
+        'prompt': prompt,
         'correct_answer': correct_answer,
-        'model_response': response,
         'predicted_answer': predicted,
+        'model_response': response,
         'is_correct': is_correct
     }
 
-def load_model(model_name=None, checkpoint_path=None, device='cuda'):
+
+def load_model(model_name: str = None, checkpoint_path: str = None, device: str = 'cuda'):
     """Load model from HuggingFace or checkpoint."""
+    
     if checkpoint_path:
-        print(f"Loading model from checkpoint: {checkpoint_path}")
-        # Load checkpoint (we'll implement saving/loading in train script)
-        checkpoint = torch.load(checkpoint_path)
-        model = checkpoint['model']
-        tokenizer = checkpoint['tokenizer']
+        print(f"Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        base_model = checkpoint.get('base_model')
+        if not base_model:
+            raise ValueError("Checkpoint missing 'base_model' field")
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype=torch.bfloat16,
+        ).to(device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
+        
     else:
         print(f"Loading base model: {model_name}")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            device_map=device
-        )
+        ).to(device)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
     
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    model.eval()
     return model, tokenizer
 
-def evaluate_dataset(model, tokenizer, dataset, device='cuda'):
+
+def evaluate_dataset(model, tokenizer, dataset: list, device: str) -> dict:
     """Evaluate model on entire dataset."""
     results = []
     correct = 0
     
     for problem in tqdm(dataset, desc="Evaluating"):
-        result = evaluate_single(model, tokenizer, problem, device)
-        results.append(result)
-        if result['is_correct']:
-            correct += 1
+        try:
+            result = evaluate_single(model, tokenizer, problem, device)
+            results.append(result)
+            if result['is_correct']:
+                correct += 1
+        except Exception as e:
+            print(f"Error on problem '{problem['problem']}': {e}")
+            results.append({
+                'problem': problem['problem'],
+                'correct_answer': problem['answer'],
+                'predicted_answer': None,
+                'model_response': f"ERROR: {e}",
+                'is_correct': False
+            })
     
-    accuracy = correct / len(dataset)
+    accuracy = correct / len(dataset) if dataset else 0
     
     return {
         'accuracy': accuracy,
@@ -107,12 +182,13 @@ def evaluate_dataset(model, tokenizer, dataset, device='cuda'):
         'results': results
     }
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, help='HuggingFace model name')
     parser.add_argument('--checkpoint', type=str, help='Path to checkpoint')
     parser.add_argument('--dataset', type=str, default='test', 
-                       choices=['train', 'val', 'test'])
+                        choices=['train', 'val', 'test'])
     parser.add_argument('--device', type=str, default='cuda')
     args = parser.parse_args()
     
@@ -120,14 +196,15 @@ def main():
         parser.error("Must specify either --model or --checkpoint")
     
     # Load dataset
-    dataset_path = Path(f'data/{args.dataset}.json')
+    dataset_path = Path(CONFIG['data_dir']) / f'{args.dataset}.json'
     print(f"Loading dataset from {dataset_path}")
     with open(dataset_path) as f:
         dataset = json.load(f)
-    print(f"✓ Loaded {len(dataset)} examples")
+    print(f"Loaded {len(dataset)} examples")
     
     # Load model
     model, tokenizer = load_model(args.model, args.checkpoint, args.device)
+    model_identifier = args.checkpoint if args.checkpoint else args.model
     
     # Evaluate
     print("\n" + "="*70)
@@ -138,26 +215,47 @@ def main():
     # Print results
     print(f"\nAccuracy: {results['accuracy']:.1%} ({results['correct']}/{results['total']})")
     
-    # Save detailed results
-    output_dir = Path('results')
+    # Build output with metadata
+    # Generate example prompt for reproducibility
+    example_prompt, _ = build_prompt("35 + 17 - 8", tokenizer)
+    
+    output = {
+        'metadata': {
+            'model': model_identifier,
+            'dataset': args.dataset,
+            'timestamp': datetime.now().isoformat(),
+            'system_message': SYSTEM_MESSAGE,
+            'max_new_tokens': MAX_NEW_TOKENS,
+            'example_prompt': example_prompt,
+        },
+        'summary': {
+            'accuracy': results['accuracy'],
+            'correct': results['correct'],
+            'total': results['total'],
+        },
+        'results': results['results']
+    }
+    
+    # Save results
+    output_dir = Path(CONFIG['results_dir'])
     output_dir.mkdir(exist_ok=True)
     
-    model_name = args.checkpoint if args.checkpoint else args.model.split('/')[-1]
-    output_file = output_dir / f"eval_{model_name}_{args.dataset}.json"
+    model_name = Path(model_identifier).stem if args.checkpoint else args.model.split('/')[-1]
+    output_file = output_dir / f"eval_{model_name}_{args.dataset}_{datetime.now():%Y%m%d_%H%M%S}.json"
     
     with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(output, f, indent=2)
     
-    print(f"\n✓ Detailed results saved to {output_file}")
+    print(f"\nResults saved to {output_file}")
     
-    # Show some examples
+    # Show sample results
     print("\n=== Sample Results ===")
-    for i, result in enumerate(results['results'][:5]):
+    for result in results['results'][:5]:
         status = "✓" if result['is_correct'] else "✗"
         print(f"{status} {result['problem']} = {result['correct_answer']}")
-        print(f"   Model said: {result['predicted_answer']}")
-        print(f"   Response: {result['model_response'][:80]}...")
+        print(f"   Model output: '{result['model_response']}' → parsed: {result['predicted_answer']}")
         print()
+
 
 if __name__ == "__main__":
     main()

@@ -1,24 +1,60 @@
 #!/usr/bin/env python3
 """
-Generate arithmetic problem datasets for RL training.
+Generate arithmetic datasets for RL training.
 
-Creates:
-- 2000 training examples (4-step arithmetic with +, -, *, /)
-- 250 validation examples
-- 250 test examples
+Produces:
+    data/train.json  (2000 problems)
+    data/val.json    (250 problems)
+    data/test.json   (250 problems)
+
+Each problem has format:
+    {"problem": "35 + 17 - 8", "answer": 44, "n_ops": 2}
 """
 
 import json
 import random
 from pathlib import Path
 
-def generate_problem(n_ops=4, operations=['+', '-', '*', '/']):
-    """Generate single arithmetic problem with n_ops operations."""
-    # Generate numbers (5-50 range, avoid 0 for division)
-    nums = [random.randint(5, 50) for _ in range(n_ops + 1)]
+# ============================================================================
+# CONFIG - User configurable settings
+# ============================================================================
+
+CONFIG = {
+    # Dataset splits
+    'splits': {
+        'train': 2000,
+        'val': 250,
+        'test': 250,
+    },
+    
+    # Problem generation
+    'n_operations': 2,                   # number of operations per problem
+    'operations': ['+', '-', '*', '/'],  # allowed operations
+    'number_range': (5, 50),             # range for random numbers (inclusive)
+    
+    # Output
+    'output_dir': 'data',
+    
+    # Reproducibility
+    'seed': 42,
+}
+
+# ============================================================================
+# PROBLEM GENERATION
+# ============================================================================
+
+
+def generate_problem(config: dict) -> dict:
+    """Generate single arithmetic problem."""
+    n_ops = config['n_operations']
+    operations = config['operations']
+    num_min, num_max = config['number_range']
+    
+    # Generate numbers (avoid 0 for division safety)
+    nums = [random.randint(num_min, num_max) for _ in range(n_ops + 1)]
     ops = [random.choice(operations) for _ in range(n_ops)]
     
-    # Build problem string
+    # Build problem string: "num op num op num ..."
     problem_str = str(nums[0])
     for op, num in zip(ops, nums[1:]):
         problem_str += f" {op} {num}"
@@ -26,12 +62,10 @@ def generate_problem(n_ops=4, operations=['+', '-', '*', '/']):
     # Calculate answer with proper order of operations
     try:
         answer = eval(problem_str)
-        # Round to 2 decimals to avoid floating point issues
         if isinstance(answer, float):
             answer = round(answer, 2)
     except ZeroDivisionError:
-        # Regenerate if division by zero
-        return generate_problem(n_ops, operations)
+        return generate_problem(config)
     
     return {
         'problem': problem_str,
@@ -39,47 +73,55 @@ def generate_problem(n_ops=4, operations=['+', '-', '*', '/']):
         'n_ops': n_ops
     }
 
-def generate_dataset(n_examples, n_ops=4, operations=['+', '-', '*', '/']):
-    """Generate dataset of n_examples problems."""
-    return [generate_problem(n_ops, operations) for _ in range(n_examples)]
+
+def generate_dataset(n: int, config: dict) -> list:
+    """Generate n unique problems."""
+    problems = []
+    seen = set()
+    
+    while len(problems) < n:
+        p = generate_problem(config)
+        if p['problem'] not in seen:
+            seen.add(p['problem'])
+            problems.append(p)
+    
+    return problems
+
 
 def main():
-    # Set random seed for reproducibility
-    random.seed(42)
+    config = CONFIG
+    random.seed(config['seed'])
     
-    # Create data directory if it doesn't exist
-    data_dir = Path('data')
-    data_dir.mkdir(exist_ok=True)
+    output_dir = Path(config['output_dir'])
+    output_dir.mkdir(exist_ok=True)
     
-    print("Generating datasets...")
+    print("Generating arithmetic datasets...")
+    print(f"Operations: {config['operations']}")
+    print(f"Number range: {config['number_range']}")
+    print(f"Operations per problem: {config['n_operations']}")
+    print(f"Seed: {config['seed']}")
+    print()
     
-    # Generate datasets
-    train_data = generate_dataset(2000, n_ops=4)
-    val_data = generate_dataset(250, n_ops=4)
-    test_data = generate_dataset(250, n_ops=4)
+    for split_name, n in config['splits'].items():
+        dataset = generate_dataset(n, config)
+        
+        output_path = output_dir / f'{split_name}.json'
+        with open(output_path, 'w') as f:
+            json.dump(dataset, f, indent=2)
+        
+        # Show stats
+        answers = [p['answer'] for p in dataset]
+        print(f"{split_name}: {n} problems saved to {output_path}")
+        print(f"  Answer range: {min(answers):.2f} to {max(answers):.2f}")
+        print()
     
-    # Save to JSON
-    datasets = {
-        'train': train_data,
-        'val': val_data,
-        'test': test_data
-    }
-    
-    for name, data in datasets.items():
-        filepath = data_dir / f'{name}.json'
-        with open(filepath, 'w') as f:
-            json.dump(data, f, indent=2)
-        print(f"✓ Saved {len(data)} examples to {filepath}")
-    
-    # Print sample problems
-    print("\n=== Sample Problems ===")
-    for i, problem in enumerate(train_data[:5]):
-        print(f"{i+1}. {problem['problem']} = {problem['answer']}")
-    
-    print("\n✓ Dataset generation complete!")
-    print(f"  Train: 2000 examples")
-    print(f"  Val:   250 examples")
-    print(f"  Test:  250 examples")
+    # Show samples
+    print("Sample problems from test set:")
+    with open(output_dir / 'test.json') as f:
+        test_data = json.load(f)
+    for p in test_data[:5]:
+        print(f"  {p['problem']} = {p['answer']}")
+
 
 if __name__ == "__main__":
     main()
