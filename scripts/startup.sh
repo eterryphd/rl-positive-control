@@ -52,7 +52,7 @@ echo "✓ Repository ready"
 
 echo ""
 echo ">>> Installing Python dependencies..."
-pip install -q transformers huggingface-hub tqdm trl datasets accelerate
+pip install -q transformers huggingface-hub tqdm trl datasets accelerate deepspeed
 echo "✓ Dependencies installed"
 
 echo ""
@@ -75,7 +75,7 @@ if [ -d "$CHECKPOINT_DIR" ] && [ "$(ls -A $CHECKPOINT_DIR 2>/dev/null)" ]; then
     echo "========================================"
     
     cd $WORKSPACE/$REPO_NAME
-    accelerate launch --multi_gpu --num_processes 4 scripts/train.py --model $MODEL
+    accelerate launch --config_file scripts/accelerate_config.yaml scripts/train.py --model $MODEL
     
     echo ""
     echo "Training complete. Running final evaluation..."
@@ -96,7 +96,7 @@ else
     echo "     python scripts/evaluate.py --model $MODEL"
     echo ""
     echo "  3. Start training:"
-    echo "     accelerate launch --multi_gpu --num_processes 4 scripts/train.py --model $MODEL"
+    echo "     accelerate launch --config_file scripts/accelerate_config.yaml scripts/train.py --model $MODEL"
     echo ""
     echo "Once training starts, if preempted, the pod will auto-resume on restart."
     echo ""
