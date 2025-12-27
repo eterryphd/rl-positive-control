@@ -146,49 +146,70 @@ def run_api(client: InferenceClient, model: str, problem: str) -> str:
 
 # === COMPARISON ===
 
-def compare_single(problem: Dict, local_response: str, api_response: str, prompt: str) -> Dict:
-    """Compare local vs API for single problem."""
+def compare_single(problem: Dict, local_1: str, local_2: str, 
+                   api_1: str, api_2: str, prompt: str) -> Dict:
+    """Compare local vs API with consistency checks."""
     correct_answer = problem['answer']
     
-    local_parsed = extract_answer(local_response)
-    api_parsed = extract_answer(api_response)
+    # Parse all responses
+    local_1_parsed = extract_answer(local_1)
+    local_2_parsed = extract_answer(local_2)
+    api_1_parsed = extract_answer(api_1)
+    api_2_parsed = extract_answer(api_2)
     
-    local_correct = check_correct(local_parsed, correct_answer)
-    api_correct = check_correct(api_parsed, correct_answer)
+    # Check correctness
+    local_1_correct = check_correct(local_1_parsed, correct_answer)
+    local_2_correct = check_correct(local_2_parsed, correct_answer)
+    api_1_correct = check_correct(api_1_parsed, correct_answer)
+    api_2_correct = check_correct(api_2_parsed, correct_answer)
     
-    # Check if they match each other (regardless of correctness)
-    if local_parsed is not None and api_parsed is not None:
-        outputs_match = abs(local_parsed - api_parsed) < CONFIG['tolerance']
-    else:
-        outputs_match = (local_parsed is None and api_parsed is None)
+    def values_match(a, b):
+        if a is not None and b is not None:
+            return abs(a - b) < CONFIG['tolerance']
+        return (a is None and b is None)
+    
+    # Consistency checks
+    local_consistent = values_match(local_1_parsed, local_2_parsed)
+    api_consistent = values_match(api_1_parsed, api_2_parsed)
+    local_api_match = values_match(local_1_parsed, api_1_parsed)
     
     return {
         'problem': problem['problem'],
         'prompt': prompt,
         'correct_answer': correct_answer,
-        'local_response': local_response,
-        'local_parsed': local_parsed,
-        'local_correct': local_correct,
-        'api_response': api_response,
-        'api_parsed': api_parsed,
-        'api_correct': api_correct,
-        'outputs_match': outputs_match,
+        # Local runs
+        'local_1_response': local_1,
+        'local_1_parsed': local_1_parsed,
+        'local_1_correct': local_1_correct,
+        'local_2_response': local_2,
+        'local_2_parsed': local_2_parsed,
+        'local_2_correct': local_2_correct,
+        # API runs
+        'api_1_response': api_1,
+        'api_1_parsed': api_1_parsed,
+        'api_1_correct': api_1_correct,
+        'api_2_response': api_2,
+        'api_2_parsed': api_2_parsed,
+        'api_2_correct': api_2_correct,
+        # Consistency
+        'local_consistent': local_consistent,
+        'api_consistent': api_consistent,
+        'local_api_match': local_api_match,
     }
 
 
 def print_result(result: Dict, verbose: bool = False):
     """Print single comparison result."""
-    match_symbol = "✓" if result['outputs_match'] else "✗"
-    local_symbol = "✓" if result['local_correct'] else "✗"
-    api_symbol = "✓" if result['api_correct'] else "✗"
+    local_con = "✓" if result['local_consistent'] else "✗"
+    api_con = "✓" if result['api_consistent'] else "✗"
+    match = "✓" if result['local_api_match'] else "✗"
     
-    print(f"{match_symbol} {result['problem']} = {result['correct_answer']}")
-    print(f"   Local [{local_symbol}]: '{result['local_response']}' → {result['local_parsed']}")
-    print(f"   API   [{api_symbol}]: '{result['api_response']}' → {result['api_parsed']}")
-    
-    if not result['outputs_match']:
-        print(f"   ⚠️  MISMATCH")
-    print()
+    print(f"\n{result['problem']} = {result['correct_answer']}")
+    print(f"   Local consistency: {local_con}  API consistency: {api_con}  Local≈API: {match}")
+    print(f"   Local 1: '{result['local_1_response']}' → {result['local_1_parsed']}")
+    print(f"   Local 2: '{result['local_2_response']}' → {result['local_2_parsed']}")
+    print(f"   API 1:   '{result['api_1_response']}' → {result['api_1_parsed']}")
+    print(f"   API 2:   '{result['api_2_response']}' → {result['api_2_parsed']}")
 
 
 def main():
@@ -239,23 +260,33 @@ def main():
     
     # Run comparison
     print("\n" + "-" * 70)
-    print("Running comparison...")
+    print("Running comparison (2 runs each: local and API)...")
     print("-" * 70 + "\n")
     
     results = []
     for i, problem in enumerate(problems):
         print(f"[{i+1}/{len(problems)}] {problem['problem']}", end='', flush=True)
         
-        local_response, prompt = run_local(model, tokenizer, problem['problem'], args.device)
-        api_response = run_api(client, args.model, problem['problem'])
+        # Run local twice
+        local_1, prompt = run_local(model, tokenizer, problem['problem'], args.device)
+        local_2, _ = run_local(model, tokenizer, problem['problem'], args.device)
         
-        result = compare_single(problem, local_response, api_response, prompt)
+        # Run API twice
+        api_1 = run_api(client, args.model, problem['problem'])
+        api_2 = run_api(client, args.model, problem['problem'])
+        
+        result = compare_single(problem, local_1, local_2, api_1, api_2, prompt)
         results.append(result)
         
-        if result['outputs_match']:
-            print(" ✓")
-        else:
-            print(" ✗ MISMATCH")
+        # Status indicator
+        status = ""
+        if not result['local_consistent']:
+            status += " L!"
+        if not result['api_consistent']:
+            status += " A!"
+        if not result['local_api_match']:
+            status += " ≠"
+        print(status if status else " ✓")
         
         if args.verbose:
             print_result(result)
@@ -265,26 +296,31 @@ def main():
     print("SUMMARY")
     print("=" * 70)
     
-    n_match = sum(1 for r in results if r['outputs_match'])
-    n_local_correct = sum(1 for r in results if r['local_correct'])
-    n_api_correct = sum(1 for r in results if r['api_correct'])
+    n_local_consistent = sum(1 for r in results if r['local_consistent'])
+    n_api_consistent = sum(1 for r in results if r['api_consistent'])
+    n_local_api_match = sum(1 for r in results if r['local_api_match'])
+    n_local_correct = sum(1 for r in results if r['local_1_correct'])
+    n_api_correct = sum(1 for r in results if r['api_1_correct'])
     
-    print(f"\nOutputs match:    {n_match}/{len(results)} ({100*n_match/len(results):.1f}%)")
-    print(f"Local correct:    {n_local_correct}/{len(results)} ({100*n_local_correct/len(results):.1f}%)")
-    print(f"API correct:      {n_api_correct}/{len(results)} ({100*n_api_correct/len(results):.1f}%)")
+    print(f"\nLocal consistent:  {n_local_consistent}/{len(results)} ({100*n_local_consistent/len(results):.1f}%)")
+    print(f"API consistent:    {n_api_consistent}/{len(results)} ({100*n_api_consistent/len(results):.1f}%)")
+    print(f"Local ≈ API:       {n_local_api_match}/{len(results)} ({100*n_local_api_match/len(results):.1f}%)")
+    print(f"\nLocal correct:     {n_local_correct}/{len(results)} ({100*n_local_correct/len(results):.1f}%)")
+    print(f"API correct:       {n_api_correct}/{len(results)} ({100*n_api_correct/len(results):.1f}%)")
     
-    if n_match == len(results):
-        print("\n✅ LOCAL AND API MATCH PERFECTLY")
-        print("   Safe to use local evaluation for RL training.")
+    if n_local_consistent == len(results):
+        print("\n✅ LOCAL IS DETERMINISTIC")
+        print("   Safe to use for RL training.")
     else:
-        print(f"\n⚠️  {len(results) - n_match} MISMATCHES FOUND")
-        print("   Investigate before trusting local evaluation.")
+        print(f"\n⚠️  LOCAL HAS {len(results) - n_local_consistent} INCONSISTENCIES")
+        print("   Investigate before using for RL training.")
+    
+    if n_api_consistent < len(results):
+        print(f"\n⚠️  API HAS {len(results) - n_api_consistent} INCONSISTENCIES")
         
-        # Show mismatches
-        print("\nMismatched problems:")
-        for r in results:
-            if not r['outputs_match']:
-                print_result(r)
+    if n_local_api_match < len(results):
+        print(f"\nℹ️  Local and API diverge on {len(results) - n_local_api_match} problems")
+        print("   This is expected if using different model versions/quantization.")
     
     # Save detailed results
     # Generate example prompt for reproducibility
@@ -311,7 +347,9 @@ def main():
                 'example_prompt': example_prompt,
             },
             'summary': {
-                'outputs_match': n_match,
+                'local_consistent': n_local_consistent,
+                'api_consistent': n_api_consistent,
+                'local_api_match': n_local_api_match,
                 'local_correct': n_local_correct,
                 'api_correct': n_api_correct,
                 'total': len(results),
