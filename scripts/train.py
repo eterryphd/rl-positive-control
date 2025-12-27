@@ -11,7 +11,9 @@ Usage:
 
 import argparse
 import json
+import os
 import re
+import shutil
 import torch
 from datetime import datetime
 from pathlib import Path
@@ -37,11 +39,12 @@ CONFIG = {
     # Training
     'learning_rate': 1e-6,
     'num_train_epochs': 1,
-    'per_device_train_batch_size': 1,   # Reduced for memory
-    'gradient_accumulation_steps': 8,
-    'num_generations': 2,                # Reduced for memory
-    'max_steps': 500,
+    'per_device_train_batch_size': 2,
+    'gradient_accumulation_steps': 4,
+    'num_generations': 4,
+    'max_steps': 100,
     'logging_steps': 10,
+    'save_steps': 25,  # Checkpoint every 25 steps
     
     # GRPO specific
     'beta': 0.1,  # KL penalty coefficient
@@ -132,6 +135,47 @@ def load_dataset_for_grpo(tokenizer) -> Dataset:
 
 
 # ============================================================================
+# CHECKPOINT MANAGEMENT
+# ============================================================================
+
+def get_checkpoints(output_dir: Path) -> list:
+    """Get sorted list of checkpoint directories (by step number)."""
+    checkpoints = []
+    for d in output_dir.iterdir():
+        if d.is_dir() and d.name.startswith('checkpoint-'):
+            try:
+                step = int(d.name.split('-')[1])
+                checkpoints.append((step, d))
+            except (IndexError, ValueError):
+                continue
+    return sorted(checkpoints, key=lambda x: x[0])
+
+
+def cleanup_checkpoints(output_dir: Path):
+    """Keep only: first, second-to-last, and last checkpoint."""
+    checkpoints = get_checkpoints(output_dir)
+    
+    if len(checkpoints) <= 3:
+        return  # Nothing to clean up
+    
+    # Indices to keep: 0 (first), -2 (second-to-last), -1 (last)
+    keep_indices = {0, len(checkpoints) - 2, len(checkpoints) - 1}
+    
+    for i, (step, path) in enumerate(checkpoints):
+        if i not in keep_indices:
+            print(f"    Removing old checkpoint: {path.name}")
+            shutil.rmtree(path)
+
+
+def find_latest_checkpoint(output_dir: Path) -> str | None:
+    """Find latest checkpoint for resumption."""
+    checkpoints = get_checkpoints(output_dir)
+    if checkpoints:
+        return str(checkpoints[-1][1])
+    return None
+
+
+# ============================================================================
 # TRAINING
 # ============================================================================
 
@@ -156,6 +200,12 @@ def train(args):
     output_dir = Path(CONFIG['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Check for existing checkpoint to resume from
+    resume_from = find_latest_checkpoint(output_dir)
+    if resume_from:
+        print(f"\n>>> Found existing checkpoint: {resume_from}")
+        print("    Will resume training from this checkpoint.")
+    
     # GRPO config
     print("\nConfiguring GRPO...")
     training_args = GRPOConfig(
@@ -168,7 +218,8 @@ def train(args):
         max_completion_length=CONFIG['max_new_tokens'],
         max_steps=CONFIG['max_steps'],
         logging_steps=CONFIG['logging_steps'],
-        save_strategy="no",          # Disable automatic checkpoints
+        save_steps=CONFIG['save_steps'],
+        save_only_model=True,  # Skip optimizer state, saves disk/time
         beta=CONFIG['beta'],
         bf16=True,
         remove_unused_columns=False,  # Keep 'answer' column for reward fn
@@ -190,20 +241,25 @@ def train(args):
         model_init_kwargs=model_init_kwargs if model_init_kwargs else None,
     )
     
-    # Save initial model (before training)
-    print("\nSaving initial model...")
-    initial_path = output_dir / "initial"
-    trainer.save_model(str(initial_path))
-    print(f"    Saved to: {initial_path}")
-    
     # Train
     print("\n" + "-" * 70)
     print("Starting training...")
     print("-" * 70)
     
-    trainer.train()
+    # Save initial model if starting fresh (not resuming)
+    initial_path = output_dir / "initial"
+    if not resume_from and not initial_path.exists():
+        print("\nSaving initial model (before training)...")
+        trainer.save_model(str(initial_path))
+        print(f"    Saved to: {initial_path}")
     
-    # Save final model
+    trainer.train(resume_from_checkpoint=resume_from)
+    
+    # Clean up old checkpoints (keep first, second-to-last, last)
+    print("\nCleaning up checkpoints...")
+    cleanup_checkpoints(output_dir)
+    
+    # Save final model separately for easy evaluation
     print("\n" + "=" * 70)
     print("Training complete!")
     print("=" * 70)
@@ -211,6 +267,10 @@ def train(args):
     final_path = output_dir / "final"
     trainer.save_model(str(final_path))
     print(f"Final model saved to: {final_path}")
+    
+    # List remaining checkpoints
+    remaining = get_checkpoints(output_dir)
+    print(f"\nCheckpoints retained: {[c[1].name for c in remaining]}")
 
 
 def main():
