@@ -227,10 +227,6 @@ def train(args):
     
     # Initialize trainer
     print("Initializing GRPO trainer...")
-    model_init_kwargs = {}
-    if args.load_in_8bit:
-        print("    Using 8-bit quantization")
-        model_init_kwargs["load_in_8bit"] = True
     
     trainer = GRPOTrainer(
         model=args.model,
@@ -238,7 +234,6 @@ def train(args):
         args=training_args,
         train_dataset=train_dataset,
         processing_class=tokenizer,
-        model_init_kwargs=model_init_kwargs if model_init_kwargs else None,
     )
     
     # Train
@@ -277,8 +272,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, required=True,
                         help='HuggingFace model name')
-    parser.add_argument('--load-in-8bit', action='store_true',
-                        help='Load model in 8-bit quantization')
     args = parser.parse_args()
     
     train(args)
