@@ -37,19 +37,18 @@ CONFIG = {
     # Training
     'learning_rate': 1e-6,
     'num_train_epochs': 1,
-    'per_device_train_batch_size': 1,
+    'per_device_train_batch_size': 1,   # Reduced for memory
     'gradient_accumulation_steps': 8,
-    'num_generations': 2,  # G in GRPO - responses per prompt
+    'num_generations': 2,                # Reduced for memory
     'max_steps': 500,
     'logging_steps': 10,
-    'save_steps': 100,
     
     # GRPO specific
     'beta': 0.1,  # KL penalty coefficient
     
-    # Paths
+    # Paths - use absolute path on persistent volume
     'data_dir': 'data',
-    'output_dir': 'checkpoints',
+    'output_dir': '/workspace/checkpoints',
 }
 
 # ============================================================================
@@ -153,10 +152,14 @@ def train(args):
     train_dataset = load_dataset_for_grpo(tokenizer)
     print(f"    Train: {len(train_dataset)} examples")
     
+    # Create output directory
+    output_dir = Path(CONFIG['output_dir'])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     # GRPO config
     print("\nConfiguring GRPO...")
     training_args = GRPOConfig(
-        output_dir=CONFIG['output_dir'],
+        output_dir=str(output_dir),
         learning_rate=CONFIG['learning_rate'],
         num_train_epochs=CONFIG['num_train_epochs'],
         per_device_train_batch_size=CONFIG['per_device_train_batch_size'],
@@ -165,7 +168,7 @@ def train(args):
         max_completion_length=CONFIG['max_new_tokens'],
         max_steps=CONFIG['max_steps'],
         logging_steps=CONFIG['logging_steps'],
-        save_steps=CONFIG['save_steps'],
+        save_strategy="no",          # Disable automatic checkpoints
         beta=CONFIG['beta'],
         bf16=True,
         remove_unused_columns=False,  # Keep 'answer' column for reward fn
@@ -173,13 +176,25 @@ def train(args):
     
     # Initialize trainer
     print("Initializing GRPO trainer...")
+    model_init_kwargs = {}
+    if args.load_in_8bit:
+        print("    Using 8-bit quantization")
+        model_init_kwargs["load_in_8bit"] = True
+    
     trainer = GRPOTrainer(
         model=args.model,
         reward_funcs=reward_fn,
         args=training_args,
         train_dataset=train_dataset,
         processing_class=tokenizer,
+        model_init_kwargs=model_init_kwargs if model_init_kwargs else None,
     )
+    
+    # Save initial model (before training)
+    print("\nSaving initial model...")
+    initial_path = output_dir / "initial"
+    trainer.save_model(str(initial_path))
+    print(f"    Saved to: {initial_path}")
     
     # Train
     print("\n" + "-" * 70)
@@ -193,15 +208,17 @@ def train(args):
     print("Training complete!")
     print("=" * 70)
     
-    final_path = Path(CONFIG['output_dir']) / "final"
+    final_path = output_dir / "final"
     trainer.save_model(str(final_path))
-    print(f"Model saved to: {final_path}")
+    print(f"Final model saved to: {final_path}")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, required=True,
                         help='HuggingFace model name')
+    parser.add_argument('--load-in-8bit', action='store_true',
+                        help='Load model in 8-bit quantization')
     args = parser.parse_args()
     
     train(args)
