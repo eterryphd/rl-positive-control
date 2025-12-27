@@ -37,9 +37,9 @@ CONFIG = {
     # Training
     'learning_rate': 1e-6,
     'num_train_epochs': 1,
-    'per_device_train_batch_size': 4,
-    'gradient_accumulation_steps': 4,
-    'num_generations': 4,  # G in GRPO - responses per prompt
+    'per_device_train_batch_size': 1,
+    'gradient_accumulation_steps': 8,
+    'num_generations': 2,  # G in GRPO - responses per prompt
     'max_steps': 500,
     'logging_steps': 10,
     'save_steps': 100,
