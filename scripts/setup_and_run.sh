@@ -62,17 +62,17 @@ echo "    PIP_CACHE_DIR=$PIP_CACHE_DIR"
 echo ""
 echo ">>> Installing dependencies with compatible versions..."
 
-# Core packages with known-compatible versions
+# Core packages with known-compatible versions (HF Cookbook Dec 2025)
 pip install --upgrade pip
 
 # Install in order to avoid conflicts
-# Using newer TRL that has vllm_mode support
-pip install torch>=2.4.0
-pip install transformers==4.48.1
-pip install accelerate==1.3.0
-pip install deepspeed==0.15.4
-pip install "trl>=0.18.0"  # Need 0.18+ for vllm_mode
-pip install "vllm>=0.7.0"
+# TESTED STACK: trl==0.23.1, vllm==0.11.0, transformers==4.57.0
+pip install "torch>=2.5.0"
+pip install transformers==4.57.0
+pip install "accelerate>=1.4.0"
+pip install "deepspeed>=0.16.0"
+pip install trl==0.23.1
+pip install vllm==0.11.0
 pip install datasets huggingface-hub tqdm
 
 echo ""

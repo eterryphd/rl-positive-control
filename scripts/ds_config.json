@@ -3,16 +3,19 @@
         "enabled": true
     },
     "zero_optimization": {
-        "stage": 2,
+        "stage": 3,
         "offload_optimizer": {
             "device": "none"
         },
-        "allgather_partitions": true,
-        "allgather_bucket_size": 2e8,
-        "reduce_scatter": true,
-        "reduce_bucket_size": 2e8,
+        "offload_param": {
+            "device": "none"
+        },
         "overlap_comm": true,
-        "contiguous_gradients": true
+        "contiguous_gradients": true,
+        "reduce_bucket_size": "auto",
+        "stage3_prefetch_bucket_size": "auto",
+        "stage3_param_persistence_threshold": "auto",
+        "stage3_gather_16bit_weights_on_model_save": true
     },
     "gradient_accumulation_steps": "auto",
     "gradient_clipping": 1.0,

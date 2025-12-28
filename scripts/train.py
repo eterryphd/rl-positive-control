@@ -5,6 +5,9 @@ RL training for arithmetic task using GRPO.
 This is a positive control to validate the RL pipeline before
 applying to more complex tasks like interleaving.
 
+TESTED STACK (HuggingFace Cookbook, Dec 2025):
+    trl==0.23.1, vllm==0.11.0, transformers==4.57.0
+
 Usage (with vLLM server mode - recommended for 4x A40):
     # Terminal 1: Start vLLM server on GPU 3
     CUDA_VISIBLE_DEVICES=3 trl vllm-serve --model meta-llama/Llama-3.1-8B-Instruct
@@ -57,8 +60,8 @@ CONFIG = {
     'learning_rate': 1e-6,
     'num_train_epochs': 1,
     'per_device_train_batch_size': 1,  # Small for 8B model
-    'gradient_accumulation_steps': 8,  # Effective batch = 1 * 3 GPUs * 8 = 24
-    'num_generations': 4,  # Completions per prompt for GRPO
+    'gradient_accumulation_steps': 8,  # Effective batch = 1 * 4 GPUs * 8 = 32
+    'num_generations': 2,  # Reduced from 4 to save memory
     'max_steps': 100,
     'logging_steps': 10,
     'save_steps': 25,

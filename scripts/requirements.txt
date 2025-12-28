@@ -1,25 +1,23 @@
 # Requirements for GRPO training with Llama 3.1 8B on 4x A40
 # 
-# NOTE: TRL ecosystem moves fast. These ranges worked as of Dec 2024.
-# If you hit issues, fall back to exact pinned versions below.
+# TESTED WORKING STACK (from HuggingFace Cookbook, Dec 2025):
+#   trl==0.23.1 + vllm==0.11.0 + transformers==4.57.0
 #
-# PINNED FALLBACK (known working combination):
-#   pip install torch==2.4.0 transformers==4.48.1 trl==0.18.0 \
-#       accelerate==1.3.0 deepspeed==0.15.4 vllm==0.7.0
+# TRL only supports vLLM versions: 0.10.2, 0.11.0, 0.11.1, 0.11.2
 
 # Core ML
-torch>=2.4.0
-transformers>=4.48.0,<4.54.0
+torch>=2.5.0
+transformers==4.57.0
 
-# TRL and RL training - need 0.18+ for vllm_mode parameter
-trl>=0.18.0
+# TRL - need 0.23+ for stable vllm_mode="server"
+trl==0.23.1
 
 # Distributed training
-accelerate>=1.3.0,<1.5.0
-deepspeed>=0.15.0,<0.17.0
+accelerate>=1.4.0
+deepspeed>=0.16.0
 
-# vLLM for fast generation during GRPO rollouts
-vllm>=0.7.0
+# vLLM - MUST be in supported range
+vllm==0.11.0
 
 # Dataset handling
 datasets>=3.0.0
