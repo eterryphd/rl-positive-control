@@ -1,106 +1,181 @@
 #!/bin/bash
 # startup.sh
 #
-# Runpod pod startup script - runs automatically when pod starts.
+# NON-INTERACTIVE startup script for Docker CMD / spot pod restarts
+# Designed to be called automatically when pod starts/restarts
 #
-# To use: In Runpod pod creation, set "Docker Command" to:
-#   bash -c "curl -sL https://raw.githubusercontent.com/eterryphd/rl-positive-control/main/startup.sh | bash"
+# Requirements:
+#   - HF_TOKEN environment variable must be set (or already logged in)
+#   - Dependencies already installed (run setup_and_run.sh first)
 #
-# Or copy this entire script into the "Docker Command" field.
-#
-# Behavior:
-#   - Always: Setup environment (clone/pull, install deps)
-#   - If checkpoints exist: Resume training automatically
-#   - If no checkpoints: Wait for manual intervention (first run)
+# Runpod Docker command example:
+#   bash -c "cd /workspace/rl-positive-control && bash scripts/startup.sh"
 
 set -e
 
-WORKSPACE="/workspace"
-REPO_NAME="rl-positive-control"
-REPO_URL="https://github.com/eterryphd/rl-positive-control.git"
-CHECKPOINT_DIR="/workspace/checkpoints"
-MODEL="meta-llama/Llama-3.1-8B-Instruct"
-
-echo "========================================"
-echo "RL Positive Control - Pod Startup"
-echo "========================================"
-echo "$(date)"
-
 # ============================================================================
-# ENVIRONMENT SETUP
+# CONFIGURATION
 # ============================================================================
 
-echo ""
-echo ">>> Installing system packages..."
-apt-get update -qq && apt-get install -y -qq tmux > /dev/null 2>&1
-echo "✓ tmux installed"
+MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-/workspace/checkpoints}"
+VLLM_PORT="${VLLM_PORT:-8000}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+echo "========================================"
+echo "GRPO Training - Spot Pod Startup"
+echo "========================================"
+echo "Time: $(date)"
+echo "Model: $MODEL"
+echo "Checkpoints: $CHECKPOINT_DIR"
 echo ""
-echo ">>> Setting up repository..."
-cd $WORKSPACE
 
-if [ -d "$REPO_NAME" ]; then
-    echo "    Pulling latest..."
-    cd $REPO_NAME
-    git pull
+# ============================================================================
+# HF_TOKEN HANDLING (NON-INTERACTIVE)
+# ============================================================================
+
+echo ">>> Checking HuggingFace authentication..."
+
+if [[ -n "$HF_TOKEN" ]]; then
+    echo "✓ Using HF_TOKEN from environment"
+    # Set token for huggingface-hub
+    export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+    # Also write to cache for libraries that check there
+    mkdir -p ~/.cache/huggingface
+    echo -n "$HF_TOKEN" > ~/.cache/huggingface/token
+elif huggingface-cli whoami &>/dev/null; then
+    echo "✓ Already logged in to HuggingFace"
 else
-    echo "    Cloning..."
-    git clone $REPO_URL
-    cd $REPO_NAME
+    echo "✗ FATAL: No HF_TOKEN environment variable and not logged in"
+    echo ""
+    echo "For spot pods, you must set HF_TOKEN in the pod configuration:"
+    echo "  1. Go to Runpod pod settings"
+    echo "  2. Add environment variable: HF_TOKEN=hf_xxxx"
+    echo ""
+    echo "Get your token from: https://huggingface.co/settings/tokens"
+    exit 1
 fi
-echo "✓ Repository ready"
-
-echo ""
-echo ">>> Installing Python dependencies..."
-pip install -q transformers huggingface-hub tqdm trl datasets accelerate deepspeed
-echo "✓ Dependencies installed"
-
-echo ""
-echo ">>> Environment check:"
-python -c "import torch; print(f'    GPUs: {torch.cuda.device_count()}')"
-python -c "import torch; print(f'    CUDA: {torch.cuda.is_available()}')"
 
 # ============================================================================
-# TRAINING DECISION
+# GPU VERIFICATION
+# ============================================================================
+
+echo ""
+echo ">>> Verifying GPU setup..."
+GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "0")
+
+if [[ "$GPU_COUNT" -lt 4 ]]; then
+    echo "✗ WARNING: Expected 4 GPUs, found $GPU_COUNT"
+    echo "  Continuing anyway, but training may fail or be suboptimal"
+else
+    echo "✓ Found $GPU_COUNT GPUs"
+fi
+
+# ============================================================================
+# CHECKPOINT DETECTION (AUTO-RESUME)
 # ============================================================================
 
 echo ""
 echo ">>> Checking for existing checkpoints..."
 
-if [ -d "$CHECKPOINT_DIR" ] && [ "$(ls -A $CHECKPOINT_DIR 2>/dev/null)" ]; then
-    echo "✓ Checkpoints found - resuming training automatically"
-    echo ""
-    echo "========================================"
-    echo "AUTO-RESUMING TRAINING"
-    echo "========================================"
-    
-    cd $WORKSPACE/$REPO_NAME
-    accelerate launch --config_file scripts/accelerate_config.yaml scripts/train.py --model $MODEL
-    
-    echo ""
-    echo "Training complete. Running final evaluation..."
-    python scripts/evaluate.py --model /workspace/checkpoints/final
-    
+RESUME_CHECKPOINT=""
+if [[ -d "$CHECKPOINT_DIR" ]]; then
+    # Find the latest checkpoint-XXXX directory
+    LATEST=$(ls -d "$CHECKPOINT_DIR"/checkpoint-* 2>/dev/null | sort -t'-' -k2 -n | tail -1)
+    if [[ -n "$LATEST" && -d "$LATEST" ]]; then
+        RESUME_CHECKPOINT="$LATEST"
+        echo "✓ Found checkpoint to resume from: $(basename $RESUME_CHECKPOINT)"
+        
+        # List all retained checkpoints
+        echo "  Retained checkpoints:"
+        ls -d "$CHECKPOINT_DIR"/checkpoint-* 2>/dev/null | while read ckpt; do
+            echo "    - $(basename $ckpt)"
+        done
+    else
+        echo "  No checkpoints found - starting fresh"
+    fi
 else
-    echo "✗ No checkpoints found - waiting for manual start"
-    echo ""
-    echo "========================================"
-    echo "FIRST RUN - MANUAL MODE"
-    echo "========================================"
-    echo ""
-    echo "This appears to be a fresh start. Run these commands manually:"
-    echo ""
-    echo "  1. tmux"
-    echo ""
-    echo "  2. Baseline evaluation:"
-    echo "     python scripts/evaluate.py --model $MODEL"
-    echo ""
-    echo "  3. Start training:"
-    echo "     accelerate launch --config_file scripts/accelerate_config.yaml scripts/train.py --model $MODEL"
-    echo ""
-    echo "Once training starts, if preempted, the pod will auto-resume on restart."
-    echo ""
-    
-    # Keep pod alive for SSH access
-    sleep infinity
+    echo "  Checkpoint directory doesn't exist - starting fresh"
+    mkdir -p "$CHECKPOINT_DIR"
 fi
+
+# ============================================================================
+# CLEANUP FUNCTION
+# ============================================================================
+
+cleanup() {
+    echo ""
+    echo ">>> Shutting down ($(date))..."
+    if [[ -n "$VLLM_PID" ]]; then
+        echo "  Stopping vLLM server (PID: $VLLM_PID)..."
+        kill $VLLM_PID 2>/dev/null || true
+        wait $VLLM_PID 2>/dev/null || true
+    fi
+    echo "  Cleanup complete"
+}
+trap cleanup EXIT INT TERM
+
+# ============================================================================
+# START VLLM SERVER
+# ============================================================================
+
+echo ""
+echo ">>> Starting vLLM server on GPU 3..."
+CUDA_VISIBLE_DEVICES=3 trl vllm-serve --model "$MODEL" --port $VLLM_PORT &
+VLLM_PID=$!
+
+# Wait for vLLM to be ready
+echo ">>> Waiting for vLLM server..."
+MAX_WAIT=180  # 3 minutes - model loading can take a while
+WAITED=0
+while ! curl -s "http://localhost:$VLLM_PORT/health" > /dev/null 2>&1; do
+    sleep 5
+    WAITED=$((WAITED + 5))
+    if [[ $WAITED -ge $MAX_WAIT ]]; then
+        echo "✗ FATAL: vLLM server failed to start within ${MAX_WAIT}s"
+        echo "  Check GPU memory and model availability"
+        exit 1
+    fi
+    # Check if vLLM process is still alive
+    if ! kill -0 $VLLM_PID 2>/dev/null; then
+        echo "✗ FATAL: vLLM server process died"
+        exit 1
+    fi
+    echo "  Waiting... (${WAITED}s / ${MAX_WAIT}s)"
+done
+echo "✓ vLLM server ready"
+
+# ============================================================================
+# LAUNCH TRAINING
+# ============================================================================
+
+echo ""
+echo "========================================"
+echo "Starting Training"
+echo "========================================"
+echo "Time: $(date)"
+if [[ -n "$RESUME_CHECKPOINT" ]]; then
+    echo "Resuming from: $(basename $RESUME_CHECKPOINT)"
+else
+    echo "Starting fresh (no checkpoint)"
+fi
+echo ""
+
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch \
+    --config_file "$SCRIPT_DIR/accelerate_config.yaml" \
+    --num_processes 3 \
+    "$SCRIPT_DIR/train.py" \
+    --model "$MODEL" \
+    --use-vllm \
+    --vllm-port $VLLM_PORT
+
+TRAIN_EXIT=$?
+
+echo ""
+echo "========================================"
+echo "Training Complete"
+echo "========================================"
+echo "Time: $(date)"
+echo "Exit code: $TRAIN_EXIT"
+
+exit $TRAIN_EXIT

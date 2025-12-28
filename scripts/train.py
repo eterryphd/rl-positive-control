@@ -5,8 +5,19 @@ RL training for arithmetic task using GRPO.
 This is a positive control to validate the RL pipeline before
 applying to more complex tasks like interleaving.
 
-Usage:
-    python train.py --model meta-llama/Llama-3.2-3B-Instruct
+Usage (with vLLM server mode - recommended for 4x A40):
+    # Terminal 1: Start vLLM server on GPU 3
+    CUDA_VISIBLE_DEVICES=3 trl vllm-serve --model meta-llama/Llama-3.1-8B-Instruct
+    
+    # Terminal 2: Launch training on GPUs 0,1,2
+    CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch \
+        --config_file accelerate_config.yaml \
+        --num_processes 3 \
+        train.py --model meta-llama/Llama-3.1-8B-Instruct
+
+Usage (without vLLM - slower but simpler):
+    accelerate launch --config_file accelerate_config.yaml train.py \
+        --model meta-llama/Llama-3.1-8B-Instruct --no-vllm
 """
 
 import argparse
@@ -14,11 +25,9 @@ import json
 import os
 import re
 import shutil
-import torch
-from datetime import datetime
 from pathlib import Path
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 from datasets import Dataset
 
@@ -36,20 +45,20 @@ CONFIG = {
     'reward_incorrect': -1.0,  # GRPO works better with negative rewards
     'tolerance': 0.01,
     
-    # Training
+    # Training - tuned for 4x A40 (48GB each)
     'learning_rate': 1e-6,
     'num_train_epochs': 1,
-    'per_device_train_batch_size': 2,
-    'gradient_accumulation_steps': 4,
-    'num_generations': 4,
+    'per_device_train_batch_size': 1,  # Small for 8B model
+    'gradient_accumulation_steps': 8,  # Effective batch = 1 * 3 GPUs * 8 = 24
+    'num_generations': 4,  # Completions per prompt for GRPO
     'max_steps': 100,
     'logging_steps': 10,
-    'save_steps': 25,  # Checkpoint every 25 steps
+    'save_steps': 25,
     
     # GRPO specific
-    'beta': 0.1,  # KL penalty coefficient
+    'beta': 0.0,  # KL penalty - 0.0 is now standard (no ref model needed)
     
-    # Paths - use absolute path on persistent volume
+    # Paths
     'data_dir': 'data',
     'output_dir': '/workspace/checkpoints',
 }
@@ -83,7 +92,7 @@ def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
     """
     rewards = []
     
-    # Get answers from kwargs if available, otherwise try to parse from prompts
+    # Get answers from kwargs if available
     answers = kwargs.get('answer', [None] * len(prompts))
     
     for completion, answer in zip(completions, answers):
@@ -141,6 +150,8 @@ def load_dataset_for_grpo(tokenizer) -> Dataset:
 def get_checkpoints(output_dir: Path) -> list:
     """Get sorted list of checkpoint directories (by step number)."""
     checkpoints = []
+    if not output_dir.exists():
+        return checkpoints
     for d in output_dir.iterdir():
         if d.is_dir() and d.name.startswith('checkpoint-'):
             try:
@@ -156,9 +167,8 @@ def cleanup_checkpoints(output_dir: Path):
     checkpoints = get_checkpoints(output_dir)
     
     if len(checkpoints) <= 3:
-        return  # Nothing to clean up
+        return
     
-    # Indices to keep: 0 (first), -2 (second-to-last), -1 (last)
     keep_indices = {0, len(checkpoints) - 2, len(checkpoints) - 1}
     
     for i, (step, path) in enumerate(checkpoints):
@@ -190,6 +200,7 @@ def train(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # Required for GRPO
     
     # Load dataset
     print("Loading dataset...")
@@ -206,24 +217,42 @@ def train(args):
         print(f"\n>>> Found existing checkpoint: {resume_from}")
         print("    Will resume training from this checkpoint.")
     
-    # GRPO config
+    # GRPO config - with proper multi-GPU settings
     print("\nConfiguring GRPO...")
-    training_args = GRPOConfig(
-        output_dir=str(output_dir),
-        learning_rate=CONFIG['learning_rate'],
-        num_train_epochs=CONFIG['num_train_epochs'],
-        per_device_train_batch_size=CONFIG['per_device_train_batch_size'],
-        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_generations=CONFIG['num_generations'],
-        max_completion_length=CONFIG['max_new_tokens'],
-        max_steps=CONFIG['max_steps'],
-        logging_steps=CONFIG['logging_steps'],
-        save_steps=CONFIG['save_steps'],
-        save_only_model=True,  # Skip optimizer state, saves disk/time
-        beta=CONFIG['beta'],
-        bf16=True,
-        remove_unused_columns=False,  # Keep 'answer' column for reward fn
-    )
+    
+    grpo_kwargs = {
+        'output_dir': str(output_dir),
+        'learning_rate': CONFIG['learning_rate'],
+        'num_train_epochs': CONFIG['num_train_epochs'],
+        'per_device_train_batch_size': CONFIG['per_device_train_batch_size'],
+        'gradient_accumulation_steps': CONFIG['gradient_accumulation_steps'],
+        'num_generations': CONFIG['num_generations'],
+        'max_completion_length': CONFIG['max_new_tokens'],
+        'max_prompt_length': 256,  # Arithmetic prompts are short
+        'max_steps': CONFIG['max_steps'],
+        'logging_steps': CONFIG['logging_steps'],
+        'save_steps': CONFIG['save_steps'],
+        'save_only_model': True,
+        'beta': CONFIG['beta'],
+        'bf16': True,
+        'gradient_checkpointing': True,  # Essential for memory
+        'remove_unused_columns': False,  # Keep 'answer' column for reward fn
+        'report_to': 'none',  # Disable wandb unless you want it
+    }
+    
+    # Add vLLM config if enabled
+    if args.use_vllm:
+        print("    vLLM: ENABLED (server mode)")
+        grpo_kwargs.update({
+            'use_vllm': True,
+            'vllm_mode': 'server',  # Expects external vLLM server
+            'vllm_server_host': args.vllm_host,
+            'vllm_server_port': args.vllm_port,
+        })
+    else:
+        print("    vLLM: DISABLED (using transformers generation)")
+    
+    training_args = GRPOConfig(**grpo_kwargs)
     
     # Initialize trainer
     print("Initializing GRPO trainer...")
@@ -241,7 +270,7 @@ def train(args):
     print("Starting training...")
     print("-" * 70)
     
-    # Save initial model if starting fresh (not resuming)
+    # Save initial model if starting fresh
     initial_path = output_dir / "initial"
     if not resume_from and not initial_path.exists():
         print("\nSaving initial model (before training)...")
@@ -250,11 +279,11 @@ def train(args):
     
     trainer.train(resume_from_checkpoint=resume_from)
     
-    # Clean up old checkpoints (keep first, second-to-last, last)
+    # Clean up old checkpoints
     print("\nCleaning up checkpoints...")
     cleanup_checkpoints(output_dir)
     
-    # Save final model separately for easy evaluation
+    # Save final model
     print("\n" + "=" * 70)
     print("Training complete!")
     print("=" * 70)
@@ -263,7 +292,6 @@ def train(args):
     trainer.save_model(str(final_path))
     print(f"Final model saved to: {final_path}")
     
-    # List remaining checkpoints
     remaining = get_checkpoints(output_dir)
     print(f"\nCheckpoints retained: {[c[1].name for c in remaining]}")
 
@@ -272,6 +300,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, required=True,
                         help='HuggingFace model name')
+    parser.add_argument('--use-vllm', action='store_true', default=True,
+                        help='Use vLLM for generation (default: True)')
+    parser.add_argument('--no-vllm', action='store_false', dest='use_vllm',
+                        help='Disable vLLM (use transformers generation)')
+    parser.add_argument('--vllm-host', type=str, default='localhost',
+                        help='vLLM server host')
+    parser.add_argument('--vllm-port', type=int, default=8000,
+                        help='vLLM server port')
     args = parser.parse_args()
     
     train(args)
