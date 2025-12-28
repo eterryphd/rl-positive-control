@@ -243,7 +243,8 @@ def train(args):
         'save_only_model': True,
         'beta': CONFIG['beta'],
         'bf16': True,
-        'gradient_checkpointing': False,  # Essential for memory
+        'gradient_checkpointing': True,
+        'gradient_checkpointing_kwargs': {'use_reentrant': False},  # Fix for shape mismatch
         'remove_unused_columns': False,  # Keep 'answer' column for reward fn
         'report_to': 'none',  # Disable wandb unless you want it
     }
