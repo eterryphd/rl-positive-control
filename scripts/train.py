@@ -63,7 +63,9 @@ CONFIG = {
     'gradient_accumulation_steps': 8,
     'max_steps': 100,
     'logging_steps': 10,
-    'save_steps': 25,
+    # NOTE: save_steps=10 for spot instance safety (~10-12 min between saves)
+    # Increase to 25-50 for on-demand instances to reduce I/O overhead
+    'save_steps': 10,
     
     # GRPO specific
     'beta': 0.0,  # KL penalty - 0.0 is now standard (no ref model needed)
@@ -251,6 +253,7 @@ def train(args):
         'max_steps': CONFIG['max_steps'],
         'logging_steps': CONFIG['logging_steps'],
         'save_steps': CONFIG['save_steps'],
+        'save_total_limit': 3,  # Keep only last 3 checkpoints to save disk
         'save_only_model': True,
         'beta': CONFIG['beta'],
         'bf16': True,
