@@ -294,30 +294,20 @@ def train(args):
     print("Starting training...")
     print("-" * 70)
     
-    # Save initial model if starting fresh
-    initial_path = output_dir / "initial"
-    if not resume_from and not initial_path.exists():
-        print("\nSaving initial model (before training)...")
-        trainer.save_model(str(initial_path))
-        print(f"    Saved to: {initial_path}")
-    
     trainer.train(resume_from_checkpoint=resume_from)
     
     # Clean up old checkpoints
     print("\nCleaning up checkpoints...")
     cleanup_checkpoints(output_dir)
     
-    # Save final model
+    # Training complete - final checkpoint is already saved by trainer
     print("\n" + "=" * 70)
     print("Training complete!")
     print("=" * 70)
     
-    final_path = output_dir / "final"
-    trainer.save_model(str(final_path))
-    print(f"Final model saved to: {final_path}")
-    
     remaining = get_checkpoints(output_dir)
     print(f"\nCheckpoints retained: {[c[1].name for c in remaining]}")
+    print(f"Use the latest checkpoint for evaluation.")
 
 
 def main():
