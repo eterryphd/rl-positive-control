@@ -25,3 +25,4 @@ datasets>=3.0.0
 # Utilities
 huggingface-hub
 tqdm
+bitsandbytes  # For 8-bit Adam optimizer

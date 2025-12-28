@@ -25,6 +25,7 @@ Usage (without vLLM - slower but simpler):
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -49,19 +50,17 @@ import trl
 CONFIG = {
     # Prompt configuration - MUST MATCH evaluate.py
     'system_message': "You are a calculator. Output only the number.",
-    'max_new_tokens': 15,
+    'max_new_tokens': 128,  # Longer to match interleaving needs
     
-    # Reward
-    'reward_correct': 1.0,
-    'reward_incorrect': -1.0,  # GRPO works better with negative rewards
-    'tolerance': 0.01,
+    # Generation
+    'temperature': 0.9,  # More diversity for reward variance
+    'num_generations': 6,  # More samples for GRPO signal
     
     # Training - tuned for 4x A40 (48GB each)
     'learning_rate': 1e-6,
     'num_train_epochs': 1,
-    'per_device_train_batch_size': 1,  # Small for 8B model
-    'gradient_accumulation_steps': 8,  # Effective batch = 1 * 4 GPUs * 8 = 32
-    'num_generations': 2,  # Reduced from 4 to save memory
+    'per_device_train_batch_size': 1,
+    'gradient_accumulation_steps': 8,
     'max_steps': 100,
     'logging_steps': 10,
     'save_steps': 25,
@@ -91,7 +90,10 @@ def extract_answer(response: str):
 
 def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
     """
-    Compute rewards for completions.
+    Compute rewards for completions using continuous relative error.
+    
+    Reward based on how close the answer is - exponential decay.
+    Perfect = +1.0, order of magnitude off ≈ -0.3, way off → -1.0
     
     Args:
         prompts: List of prompt strings
@@ -99,23 +101,28 @@ def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
         **kwargs: May contain 'answer' from dataset
     
     Returns:
-        List of reward floats
+        List of reward floats in [-1, 1]
     """
     rewards = []
-    
-    # Get answers from kwargs if available
     answers = kwargs.get('answer', [None] * len(prompts))
     
     for completion, answer in zip(completions, answers):
         predicted = extract_answer(completion)
         
-        if predicted is not None and answer is not None:
-            if abs(predicted - answer) < CONFIG['tolerance']:
-                rewards.append(CONFIG['reward_correct'])
-            else:
-                rewards.append(CONFIG['reward_incorrect'])
-        else:
-            rewards.append(CONFIG['reward_incorrect'])
+        if predicted is None or answer is None:
+            rewards.append(-1.0)
+            continue
+        
+        # Relative error (add 1 to denominator to handle answer=0)
+        relative_error = abs(predicted - answer) / (abs(answer) + 1)
+        
+        # Exponential decay: perfect=1.0, 10% off≈0.6, 50% off≈0.08
+        raw_reward = math.exp(-relative_error * 5)
+        
+        # Scale to [-1, 1]
+        reward = 2 * raw_reward - 1
+        
+        rewards.append(reward)
     
     return rewards
 
@@ -240,12 +247,14 @@ def train(args):
         'num_generations': CONFIG['num_generations'],
         'max_completion_length': CONFIG['max_new_tokens'],
         'max_prompt_length': 256,  # Arithmetic prompts are short
+        'temperature': CONFIG['temperature'],  # Diversity for reward variance
         'max_steps': CONFIG['max_steps'],
         'logging_steps': CONFIG['logging_steps'],
         'save_steps': CONFIG['save_steps'],
         'save_only_model': True,
         'beta': CONFIG['beta'],
         'bf16': True,
+        'optim': 'adamw_bnb_8bit',  # 8-bit Adam - half optimizer memory
         'gradient_checkpointing': True,
         'gradient_checkpointing_kwargs': {'use_reentrant': False},  # Fix for shape mismatch
         'remove_unused_columns': False,  # Keep 'answer' column for reward fn

@@ -26,6 +26,14 @@ echo "========================================"
 echo "Time: $(date)"
 echo ""
 
+# ============================================================================
+# INSTALL SYSTEM TOOLS
+# ============================================================================
+
+echo ">>> Installing system tools..."
+apt-get update && apt-get install -y tmux nano
+echo "✓ Installed tmux, nano"
+
 WORKSPACE="/workspace"
 REPO_NAME="rl-positive-control"
 MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
@@ -73,7 +81,7 @@ pip install "accelerate>=1.4.0"
 pip install "deepspeed>=0.16.0"
 pip install trl==0.23.1
 pip install vllm==0.11.0
-pip install datasets huggingface-hub tqdm
+pip install datasets huggingface-hub tqdm bitsandbytes
 
 echo ""
 echo ">>> Installed versions:"
