@@ -22,6 +22,12 @@ CHECKPOINT_DIR="${CHECKPOINT_DIR:-/workspace/checkpoints}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Cache directories - prevent filling root filesystem
+export HF_HOME="/workspace/.cache/huggingface"
+export PIP_CACHE_DIR="/workspace/.cache/pip"
+export TRITON_CACHE_DIR="/workspace/.cache/triton"
+mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$TRITON_CACHE_DIR"
+
 echo "========================================"
 echo "GRPO Training - Spot Pod Startup"
 echo "========================================"

@@ -4,10 +4,11 @@
 # FIRST-RUN setup for GRPO training on Runpod with 4x A40
 # 
 # This script:
-#   1. Installs pinned compatible dependencies
-#   2. Verifies HuggingFace authentication (supports HF_TOKEN env var)
-#   3. Validates GPU setup
-#   4. Prints launch instructions
+#   1. Sets up cache directories on /workspace (not root fs)
+#   2. Installs pinned compatible dependencies
+#   3. Verifies HuggingFace authentication (supports HF_TOKEN env var)
+#   4. Validates GPU setup
+#   5. Prints launch instructions
 #
 # For automatic restarts (spot pods), use startup.sh instead.
 #
@@ -30,6 +31,31 @@ REPO_NAME="rl-positive-control"
 MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 
 # ============================================================================
+# CACHE DIRECTORIES - Prevent filling root filesystem
+# ============================================================================
+
+echo ">>> Setting up cache directories on /workspace..."
+export HF_HOME="$WORKSPACE/.cache/huggingface"
+export PIP_CACHE_DIR="$WORKSPACE/.cache/pip"
+export TRITON_CACHE_DIR="$WORKSPACE/.cache/triton"
+
+mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$TRITON_CACHE_DIR"
+
+# Also clear any existing root cache to free space
+if [ -d ~/.cache/huggingface ]; then
+    echo "    Clearing old HF cache from root..."
+    rm -rf ~/.cache/huggingface
+fi
+if [ -d ~/.cache/pip ]; then
+    echo "    Clearing old pip cache from root..."
+    rm -rf ~/.cache/pip
+fi
+
+echo "✓ Caches configured:"
+echo "    HF_HOME=$HF_HOME"
+echo "    PIP_CACHE_DIR=$PIP_CACHE_DIR"
+
+# ============================================================================
 # INSTALL DEPENDENCIES WITH PINNED VERSIONS
 # ============================================================================
 
@@ -40,21 +66,22 @@ echo ">>> Installing dependencies with compatible versions..."
 pip install --upgrade pip
 
 # Install in order to avoid conflicts
+# Using newer TRL that has vllm_mode support
 pip install torch>=2.4.0
 pip install transformers==4.48.1
 pip install accelerate==1.3.0
 pip install deepspeed==0.15.4
-pip install trl==0.16.1
-pip install vllm==0.7.0
+pip install "trl>=0.18.0"  # Need 0.18+ for vllm_mode
+pip install "vllm>=0.7.0"
 pip install datasets huggingface-hub tqdm
 
 echo ""
 echo ">>> Installed versions:"
-pip show trl | grep Version
-pip show accelerate | grep Version
-pip show deepspeed | grep Version
-pip show transformers | grep Version
-pip show vllm | grep Version
+pip show trl | grep -E "^(Name|Version)"
+pip show accelerate | grep -E "^(Name|Version)"
+pip show deepspeed | grep -E "^(Name|Version)"
+pip show transformers | grep -E "^(Name|Version)"
+pip show vllm | grep -E "^(Name|Version)"
 
 # ============================================================================
 # VERIFY GPU SETUP

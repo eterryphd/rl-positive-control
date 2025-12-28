@@ -27,9 +27,17 @@ import re
 import shutil
 from pathlib import Path
 
+# Set cache directories before importing HF libraries
+# This prevents filling up the root filesystem on Runpod
+if 'HF_HOME' not in os.environ:
+    os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
+if 'PIP_CACHE_DIR' not in os.environ:
+    os.environ['PIP_CACHE_DIR'] = '/workspace/.cache/pip'
+
 from transformers import AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 from datasets import Dataset
+import trl
 
 # ============================================================================
 # CONFIG - User configurable settings
@@ -243,12 +251,28 @@ def train(args):
     # Add vLLM config if enabled
     if args.use_vllm:
         print("    vLLM: ENABLED (server mode)")
-        grpo_kwargs.update({
-            'use_vllm': True,
-            'vllm_mode': 'server',  # Expects external vLLM server
-            'vllm_server_host': args.vllm_host,
-            'vllm_server_port': args.vllm_port,
-        })
+        print(f"    TRL version: {trl.__version__}")
+        
+        # TRL API changed over versions - detect what's available
+        import inspect
+        grpo_params = inspect.signature(GRPOConfig).parameters
+        
+        grpo_kwargs['use_vllm'] = True
+        
+        # vllm_mode was added in TRL ~0.16+
+        if 'vllm_mode' in grpo_params:
+            grpo_kwargs['vllm_mode'] = 'server'
+            print("    Using vllm_mode='server'")
+        
+        # Server host/port config
+        if 'vllm_server_host' in grpo_params:
+            grpo_kwargs['vllm_server_host'] = args.vllm_host
+            grpo_kwargs['vllm_server_port'] = args.vllm_port
+        elif 'vllm_server_url' in grpo_params:
+            # Some versions use URL instead
+            grpo_kwargs['vllm_server_url'] = f"http://{args.vllm_host}:{args.vllm_port}"
+        
+        print(f"    Server: {args.vllm_host}:{args.vllm_port}")
     else:
         print("    vLLM: DISABLED (using transformers generation)")
     
