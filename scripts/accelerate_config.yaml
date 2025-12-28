@@ -1,11 +1,10 @@
 # Accelerate config for GRPO training on 4 GPUs (no vLLM mode)
-# Uses external ds_config.json for DeepSpeed ZeRO-3 settings
-# NOTE: ds_config path must be absolute or script must run from scripts/ dir
+# Uses external ds_config.json for DeepSpeed ZeRO-2 settings
 compute_environment: LOCAL_MACHINE
 debug: false
 deepspeed_config:
   deepspeed_config_file: /workspace/rl-positive-control/scripts/ds_config.json
-  zero3_init_flag: true
+  zero3_init_flag: false
 distributed_type: DEEPSPEED
 downcast_bf16: 'no'
 machine_rank: 0
