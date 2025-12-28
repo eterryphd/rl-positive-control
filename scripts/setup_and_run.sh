@@ -138,33 +138,49 @@ for i in range(torch.cuda.device_count()):
 "
 
 # ============================================================================
-# HUGGINGFACE LOGIN CHECK (supports HF_TOKEN env var)
+# HUGGINGFACE LOGIN CHECK (supports HF_TOKEN env var + network volume)
 # ============================================================================
 
 echo ""
 echo ">>> Checking HuggingFace authentication..."
 
+# Try loading from network volume first
+if [[ -z "$HF_TOKEN" ]] && [[ -f "$WORKSPACE/.cache/huggingface/token" ]]; then
+    export HF_TOKEN=$(cat "$WORKSPACE/.cache/huggingface/token")
+    echo "  Loaded HF_TOKEN from network volume"
+fi
+
 if [[ -n "$HF_TOKEN" ]]; then
-    echo "✓ Using HF_TOKEN from environment"
-    # Set token for huggingface-hub
+    echo "✓ Using HF_TOKEN"
     export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
-    # Also write to cache for libraries that check there
     mkdir -p ~/.cache/huggingface
     echo -n "$HF_TOKEN" > ~/.cache/huggingface/token
-    echo "  Token cached for subsequent runs"
+    # Save to network volume for persistence
+    echo -n "$HF_TOKEN" > "$WORKSPACE/.cache/huggingface/token"
+    echo "  Token saved to network volume"
 elif huggingface-cli whoami &>/dev/null; then
     echo "✓ Already logged in to HuggingFace"
+    # Save token to network volume if not there
+    if [[ -f ~/.cache/huggingface/token ]] && [[ ! -f "$WORKSPACE/.cache/huggingface/token" ]]; then
+        cp ~/.cache/huggingface/token "$WORKSPACE/.cache/huggingface/token"
+        echo "  Saved token to network volume for future restarts"
+    fi
 else
     echo "Not logged in and no HF_TOKEN set."
     echo ""
     echo "Options:"
-    echo "  1. Set HF_TOKEN environment variable (recommended for spot pods)"
-    echo "  2. Run interactive login now"
+    echo "  1. Set HF_TOKEN environment variable"
+    echo "  2. Run interactive login now (will be saved to network volume)"
     echo ""
     read -p "Run interactive login? [y/N] " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         huggingface-cli login
+        # Save to network volume after login
+        if [[ -f ~/.cache/huggingface/token ]]; then
+            cp ~/.cache/huggingface/token "$WORKSPACE/.cache/huggingface/token"
+            echo "  Token saved to network volume for future restarts"
+        fi
     else
         echo "Skipping login. You'll need to set HF_TOKEN before training."
     fi

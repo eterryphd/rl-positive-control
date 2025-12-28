@@ -79,21 +79,35 @@ fi
 echo ""
 echo ">>> Checking HuggingFace authentication..."
 
+# Try loading from network volume first
+if [[ -z "$HF_TOKEN" ]] && [[ -f "$WORKSPACE/.cache/huggingface/token" ]]; then
+    export HF_TOKEN=$(cat "$WORKSPACE/.cache/huggingface/token")
+    echo "  Loaded HF_TOKEN from network volume"
+fi
+
 if [[ -n "$HF_TOKEN" ]]; then
-    echo "✓ Using HF_TOKEN from environment"
-    # Set token for huggingface-hub
+    echo "✓ Using HF_TOKEN"
     export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
-    # Also write to cache for libraries that check there
     mkdir -p ~/.cache/huggingface
     echo -n "$HF_TOKEN" > ~/.cache/huggingface/token
+    # Also save to network volume for next restart
+    echo -n "$HF_TOKEN" > "$WORKSPACE/.cache/huggingface/token"
 elif huggingface-cli whoami &>/dev/null; then
     echo "✓ Already logged in to HuggingFace"
+    # Save token to network volume if not there
+    if [[ -f ~/.cache/huggingface/token ]] && [[ ! -f "$WORKSPACE/.cache/huggingface/token" ]]; then
+        cp ~/.cache/huggingface/token "$WORKSPACE/.cache/huggingface/token"
+        echo "  Saved token to network volume for future restarts"
+    fi
 else
     echo "✗ FATAL: No HF_TOKEN environment variable and not logged in"
     echo ""
     echo "For spot pods, you must set HF_TOKEN in the pod configuration:"
     echo "  1. Go to Runpod pod settings"
     echo "  2. Add environment variable: HF_TOKEN=hf_xxxx"
+    echo ""
+    echo "Or login manually and it will be saved to network volume:"
+    echo "  huggingface-cli login"
     echo ""
     echo "Get your token from: https://huggingface.co/settings/tokens"
     exit 1

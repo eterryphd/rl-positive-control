@@ -63,8 +63,15 @@ echo ""
 # ============================================================================
 
 echo ">>> Checking HuggingFace authentication..."
+
+# Try loading from network volume first
+if [[ -z "$HF_TOKEN" ]] && [[ -f "$WORKSPACE/.cache/huggingface/token" ]]; then
+    export HF_TOKEN=$(cat "$WORKSPACE/.cache/huggingface/token")
+    echo "  Loaded HF_TOKEN from network volume"
+fi
+
 if [[ -n "$HF_TOKEN" ]]; then
-    echo "✓ Using HF_TOKEN from environment"
+    echo "✓ Using HF_TOKEN"
     export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
     mkdir -p ~/.cache/huggingface
     echo -n "$HF_TOKEN" > ~/.cache/huggingface/token
@@ -94,7 +101,7 @@ if $USE_VLLM; then
     
     # Wait for vLLM to be ready
     echo ">>> Waiting for vLLM server to start..."
-    MAX_WAIT=120
+    MAX_WAIT=300
     WAITED=0
     while ! curl -s "http://localhost:$VLLM_PORT/health" > /dev/null 2>&1; do
         sleep 2
