@@ -1,16 +1,17 @@
-# Accelerate config for GRPO training on 3 GPUs (GPU 3 reserved for vLLM)
+# Accelerate config for GRPO training on 4 GPUs (no vLLM mode)
 # Uses external ds_config.json for DeepSpeed ZeRO-3 settings
+# NOTE: ds_config path must be absolute or script must run from scripts/ dir
 compute_environment: LOCAL_MACHINE
 debug: false
 deepspeed_config:
-  deepspeed_config_file: ds_config.json
+  deepspeed_config_file: /workspace/rl-positive-control/scripts/ds_config.json
   zero3_init_flag: true
 distributed_type: DEEPSPEED
 downcast_bf16: 'no'
 machine_rank: 0
 main_training_function: main
 num_machines: 1
-num_processes: 3
+num_processes: 4
 rdzv_backend: static
 same_network: true
 tpu_env: []
