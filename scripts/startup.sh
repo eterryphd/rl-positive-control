@@ -4,9 +4,13 @@
 # NON-INTERACTIVE startup script for Docker CMD / spot pod restarts
 # Designed to be called automatically when pod starts/restarts
 #
+# This script:
+#   - Activates venv from network volume (packages persist!)
+#   - Runs setup if venv doesn't exist
+#   - Resumes from latest checkpoint automatically
+#
 # Requirements:
 #   - HF_TOKEN environment variable must be set (or already logged in)
-#   - Dependencies already installed (run setup_and_run.sh first)
 #
 # Runpod Docker command example:
 #   bash -c "cd /workspace/rl-positive-control && bash scripts/startup.sh"
@@ -21,11 +25,13 @@ MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-/workspace/checkpoints}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE="/workspace"
+VENV_DIR="$WORKSPACE/venv"
 
 # Cache directories - prevent filling root filesystem
-export HF_HOME="/workspace/.cache/huggingface"
-export PIP_CACHE_DIR="/workspace/.cache/pip"
-export TRITON_CACHE_DIR="/workspace/.cache/triton"
+export HF_HOME="$WORKSPACE/.cache/huggingface"
+export PIP_CACHE_DIR="$WORKSPACE/.cache/pip"
+export TRITON_CACHE_DIR="$WORKSPACE/.cache/triton"
 mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$TRITON_CACHE_DIR"
 
 echo "========================================"
@@ -37,9 +43,40 @@ echo "Checkpoints: $CHECKPOINT_DIR"
 echo ""
 
 # ============================================================================
+# SYSTEM TOOLS (must reinstall each restart - not on network volume)
+# ============================================================================
+
+echo ">>> Installing system tools..."
+apt-get update && apt-get install -y tmux nano > /dev/null 2>&1
+echo "✓ Installed tmux, nano"
+
+# ============================================================================
+# VIRTUAL ENVIRONMENT - Persists on network volume!
+# ============================================================================
+
+echo ""
+echo ">>> Checking virtual environment..."
+
+if [ -d "$VENV_DIR" ] && [ -f "$VENV_DIR/bin/activate" ]; then
+    source "$VENV_DIR/bin/activate"
+    
+    # Verify packages are there
+    if python -c "import trl, vllm, deepspeed" 2>/dev/null; then
+        echo "✓ Activated venv with all packages"
+    else
+        echo "✗ Venv exists but packages missing - running setup..."
+        source "$SCRIPT_DIR/setup_and_run.sh"
+    fi
+else
+    echo "✗ No venv found - running first-time setup..."
+    source "$SCRIPT_DIR/setup_and_run.sh"
+fi
+
+# ============================================================================
 # HF_TOKEN HANDLING (NON-INTERACTIVE)
 # ============================================================================
 
+echo ""
 echo ">>> Checking HuggingFace authentication..."
 
 if [[ -n "$HF_TOKEN" ]]; then
@@ -68,7 +105,7 @@ fi
 
 echo ""
 echo ">>> Verifying GPU setup..."
-GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "0")
+GPU_COUNT=$(python -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "0")
 
 if [[ "$GPU_COUNT" -lt 4 ]]; then
     echo "✗ WARNING: Expected 4 GPUs, found $GPU_COUNT"

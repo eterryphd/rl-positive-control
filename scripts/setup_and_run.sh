@@ -36,6 +36,7 @@ echo "✓ Installed tmux, nano"
 
 WORKSPACE="/workspace"
 REPO_NAME="rl-positive-control"
+VENV_DIR="$WORKSPACE/venv"
 MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 
 # ============================================================================
@@ -64,24 +65,54 @@ echo "    HF_HOME=$HF_HOME"
 echo "    PIP_CACHE_DIR=$PIP_CACHE_DIR"
 
 # ============================================================================
-# INSTALL DEPENDENCIES WITH PINNED VERSIONS
+# VIRTUAL ENVIRONMENT - Persists on network volume across restarts
 # ============================================================================
 
 echo ""
-echo ">>> Installing dependencies with compatible versions..."
+echo ">>> Setting up virtual environment at $VENV_DIR..."
 
-# Core packages with known-compatible versions (HF Cookbook Dec 2025)
-pip install --upgrade pip
+if [ -d "$VENV_DIR" ]; then
+    echo "    Existing venv found, activating..."
+    source "$VENV_DIR/bin/activate"
+    echo "✓ Activated existing venv"
+    
+    # Check if packages are installed
+    if python -c "import trl" 2>/dev/null; then
+        echo "✓ Packages already installed, skipping pip install"
+        SKIP_INSTALL=1
+    else
+        echo "    Packages missing, will reinstall..."
+        SKIP_INSTALL=0
+    fi
+else
+    echo "    Creating new venv..."
+    python -m venv "$VENV_DIR"
+    source "$VENV_DIR/bin/activate"
+    echo "✓ Created and activated new venv"
+    SKIP_INSTALL=0
+fi
 
-# Install in order to avoid conflicts
-# TESTED STACK: trl==0.23.1, vllm==0.11.0, transformers==4.57.0
-pip install "torch>=2.5.0"
-pip install transformers==4.57.0
-pip install "accelerate>=1.4.0"
-pip install "deepspeed>=0.16.0"
-pip install trl==0.23.1
-pip install vllm==0.11.0
-pip install datasets huggingface-hub tqdm bitsandbytes
+# ============================================================================
+# INSTALL DEPENDENCIES WITH PINNED VERSIONS
+# ============================================================================
+
+if [ "$SKIP_INSTALL" != "1" ]; then
+    echo ""
+    echo ">>> Installing dependencies with compatible versions..."
+    
+    # Core packages with known-compatible versions (HF Cookbook Dec 2025)
+    pip install --upgrade pip
+    
+    # Install in order to avoid conflicts
+    # TESTED STACK: trl==0.23.1, vllm==0.11.0, transformers==4.57.0
+    pip install "torch>=2.5.0"
+    pip install transformers==4.57.0
+    pip install "accelerate>=1.4.0"
+    pip install "deepspeed>=0.16.0"
+    pip install trl==0.23.1
+    pip install vllm==0.11.0
+    pip install datasets huggingface-hub tqdm bitsandbytes
+fi
 
 echo ""
 echo ">>> Installed versions:"

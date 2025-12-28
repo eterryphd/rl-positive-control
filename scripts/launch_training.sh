@@ -19,12 +19,27 @@ MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 USE_VLLM=true
 VLLM_PORT=8000
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE="/workspace"
+VENV_DIR="$WORKSPACE/venv"
 
 # Cache directories - prevent filling root filesystem
-export HF_HOME="/workspace/.cache/huggingface"
-export PIP_CACHE_DIR="/workspace/.cache/pip"
-export TRITON_CACHE_DIR="/workspace/.cache/triton"
+export HF_HOME="$WORKSPACE/.cache/huggingface"
+export PIP_CACHE_DIR="$WORKSPACE/.cache/pip"
+export TRITON_CACHE_DIR="$WORKSPACE/.cache/triton"
 mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$TRITON_CACHE_DIR"
+
+# ============================================================================
+# ACTIVATE VENV
+# ============================================================================
+
+if [ -d "$VENV_DIR" ] && [ -f "$VENV_DIR/bin/activate" ]; then
+    source "$VENV_DIR/bin/activate"
+    echo "✓ Activated venv: $VENV_DIR"
+else
+    echo "✗ No venv found at $VENV_DIR"
+    echo "  Run setup_and_run.sh first"
+    exit 1
+fi
 
 # Parse args
 while [[ $# -gt 0 ]]; do
