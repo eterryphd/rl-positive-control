@@ -9,6 +9,9 @@
 # Usage:
 #   bash launch_training.sh [--model MODEL] [--no-vllm]
 #
+# Optional Usage:
+#  bash scripts/launch_training.sh 2>&1 & | tee -a training.log
+#
 # With HF_TOKEN:
 #   HF_TOKEN=hf_xxxx bash launch_training.sh
 
@@ -118,7 +121,7 @@ if $USE_VLLM; then
     
     # Wait for vLLM to be ready
     echo ">>> Waiting for vLLM server to start..."
-    MAX_WAIT=300
+    MAX_WAIT=900
     WAITED=0
     while ! curl -s "http://localhost:$VLLM_PORT/health" > /dev/null 2>&1; do
         sleep 2
