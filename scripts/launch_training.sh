@@ -94,6 +94,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ============================================================================
+# MODEL PRE-DOWNLOAD
+# ============================================================================
+
+echo ">>> Pre-downloading model if not cached: $MODEL"
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$MODEL', cache_dir='$HF_HOME')"
+if [ $? -eq 0 ]; then
+    echo "Model ready in cache"
+else
+    echo "ERROR: Failed to prepare model. Check network, HF_TOKEN, and model access."
+    exit 1
+fi
+echo ""
+
+# ============================================================================
+# VLLM SERVER STARTUP
+# ============================================================================
 if $USE_VLLM; then
     echo ">>> Starting vLLM server on GPU 3..."
     CUDA_VISIBLE_DEVICES=3 trl vllm-serve --model "$MODEL" --port $VLLM_PORT &
