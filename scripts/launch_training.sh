@@ -24,6 +24,7 @@ VLLM_PORT=8000
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="/workspace"
 VENV_DIR="$WORKSPACE/venv"
+MAX_MODEL_LENGTH=8192
 
 # Cache directories - prevent filling root filesystem
 export HF_HOME="$WORKSPACE/.cache/huggingface"
@@ -116,7 +117,7 @@ echo ""
 # ============================================================================
 if $USE_VLLM; then
     echo ">>> Starting vLLM server on GPU 3..."
-    CUDA_VISIBLE_DEVICES=3 trl vllm-serve --model "$MODEL" --port $VLLM_PORT &
+    CUDA_VISIBLE_DEVICES=3 trl vllm-serve --model "$MODEL" --port $VLLM_PORT --max-model-len $MAX_MODEL_LENGTH &
     VLLM_PID=$!
     
     # Wait for vLLM to be ready
