@@ -253,7 +253,7 @@ def train(args):
         'max_steps': CONFIG['max_steps'],
         'logging_steps': CONFIG['logging_steps'],
         'save_steps': CONFIG['save_steps'],
-        'save_total_limit': 2,  # Keep only last 2 checkpoints (~50GB each)
+        'save_total_limit': 3,  # Keep only last 2 checkpoints (~50GB each)
         # NOTE: save_only_model=False required for DeepSpeed resume on spot pods
         # Checkpoints are larger but can actually resume training
         'save_only_model': False,
