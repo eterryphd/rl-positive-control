@@ -71,6 +71,15 @@ export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800  # 30 min (default is 480s)
 export NCCL_TIMEOUT=1800
 
 # ============================================================================
+# DEBUG LOGGING - Verbose output to diagnose hangs
+# ============================================================================
+
+export TORCH_LOGS="dynamo,inductor"
+export TORCHDYNAMO_VERBOSE=1
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export NCCL_DEBUG=INFO
+
+# ============================================================================
 # ACTIVATE VENV
 # ============================================================================
 

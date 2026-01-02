@@ -316,7 +316,7 @@ def train(args):
         'gradient_checkpointing_kwargs': {'use_reentrant': False},  # Fix for shape mismatch
         'remove_unused_columns': False,  # Keep 'answer' column for reward fn
         'report_to': 'none',  # Disable wandb unless you want it
-        'torch_compile': False,  # Skip compile - saves 10+ min startup on cold cache
+        'torch_compile': True,  # Skip compile - saves 10+ min startup on cold cache
     }
     
     # Add vLLM config if enabled
