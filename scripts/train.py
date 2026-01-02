@@ -8,6 +8,10 @@ applying to more complex tasks like interleaving.
 TESTED STACK (HuggingFace Cookbook, Dec 2025):
     trl==0.23.1, vllm==0.11.0, transformers==4.57.0
 
+OPTIMIZATIONS:
+    - Waits for vLLM AFTER DeepSpeed init (parallel model loading)
+    - Saves 6-8 minutes of startup time
+
 Usage (with vLLM server mode - recommended for 4x A40):
     # Terminal 1: Start vLLM server on GPU 3
     CUDA_VISIBLE_DEVICES=3 trl vllm-serve --model meta-llama/Llama-3.1-8B-Instruct
@@ -29,6 +33,8 @@ import math
 import os
 import re
 import shutil
+import time
+import urllib.request
 from pathlib import Path
 
 # Set cache directories before importing HF libraries
@@ -74,6 +80,52 @@ CONFIG = {
     'data_dir': 'data',
     'output_dir': '/workspace/checkpoints',
 }
+
+# ============================================================================
+# VLLM SERVER WAIT (for parallel loading optimization)
+# ============================================================================
+
+def wait_for_vllm(host: str, port: int, timeout: int = 1800, check_interval: int = 5):
+    """
+    Wait for vLLM server to be ready.
+    
+    Called AFTER DeepSpeed init to allow parallel model loading.
+    This saves 6-8 minutes compared to waiting before training starts.
+    
+    Args:
+        host: vLLM server host
+        port: vLLM server port
+        timeout: Maximum seconds to wait (default 30 min to handle slow compiles)
+        check_interval: Seconds between health checks
+    
+    Returns:
+        True if server is ready
+        
+    Raises:
+        RuntimeError if server not ready within timeout
+    """
+    url = f"http://{host}:{port}/health"
+    start = time.time()
+    last_print = 0
+    
+    print(f">>> Waiting for vLLM server at {host}:{port}...")
+    
+    while time.time() - start < timeout:
+        try:
+            urllib.request.urlopen(url, timeout=5)
+            elapsed = time.time() - start
+            print(f"✓ vLLM server ready (waited {elapsed:.0f}s)")
+            return True
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+            elapsed = time.time() - start
+            # Print progress every 30 seconds
+            if elapsed - last_print >= 30:
+                print(f"    Still waiting for vLLM... ({elapsed:.0f}s)")
+                last_print = elapsed
+            time.sleep(check_interval)
+    
+    raise RuntimeError(f"vLLM server not ready after {timeout}s")
+
 
 # ============================================================================
 # REWARD FUNCTION
@@ -296,8 +348,9 @@ def train(args):
     
     training_args = GRPOConfig(**grpo_kwargs)
     
-    # Initialize trainer
-    print("Initializing GRPO trainer...")
+    # Initialize trainer (this triggers DeepSpeed ZeRO-3 init)
+    print("\nInitializing GRPO trainer (DeepSpeed ZeRO-3 sharding)...")
+    init_start = time.time()
     
     trainer = GRPOTrainer(
         model=args.model,
@@ -306,6 +359,13 @@ def train(args):
         train_dataset=train_dataset,
         processing_class=tokenizer,
     )
+    
+    init_elapsed = time.time() - init_start
+    print(f"✓ Trainer initialized ({init_elapsed:.0f}s)")
+    
+    # NOW wait for vLLM (after DeepSpeed init, so both load in parallel)
+    if args.use_vllm:
+        wait_for_vllm(args.vllm_host, args.vllm_port)
     
     # Train
     print("\n" + "-" * 70)

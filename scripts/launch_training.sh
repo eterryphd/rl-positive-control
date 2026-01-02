@@ -2,15 +2,17 @@
 # launch_training.sh
 #
 # One-command launcher for GRPO training with vLLM
-# Starts vLLM server in background, waits for it, then launches training
+# 
+# OPTIMIZATIONS:
+#   1. Parallel model loading - vLLM and DeepSpeed init simultaneously
+#   2. Local compile cache - fast I/O during torch.compile, synced to network volume
+#   3. --enforce-eager on vLLM - skip CUDA graph compilation
+#   4. Extended NCCL timeout - prevent false deadlock detection during compile
 #
 # For spot pods with auto-restart, use startup.sh instead.
 #
 # Usage:
 #   bash launch_training.sh [--model MODEL] [--no-vllm]
-#
-# Optional Usage:
-#  bash scripts/launch_training.sh 2>&1 & | tee -a training.log
 #
 # With HF_TOKEN:
 #   HF_TOKEN=hf_xxxx bash launch_training.sh
@@ -26,11 +28,47 @@ WORKSPACE="/workspace"
 VENV_DIR="$WORKSPACE/venv"
 MAX_MODEL_LENGTH=8192
 
-# Cache directories - prevent filling root filesystem
+# ============================================================================
+# CACHE DIRECTORIES - HF/pip on network volume (large, sequential reads OK)
+# ============================================================================
+
 export HF_HOME="$WORKSPACE/.cache/huggingface"
 export PIP_CACHE_DIR="$WORKSPACE/.cache/pip"
-export TRITON_CACHE_DIR="$WORKSPACE/.cache/triton"
-mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$TRITON_CACHE_DIR"
+mkdir -p "$HF_HOME" "$PIP_CACHE_DIR"
+
+# ============================================================================
+# COMPILE CACHE - Local storage for speed, sync to network for persistence
+# ============================================================================
+
+LOCAL_CACHE="/tmp/compile_cache"
+NETWORK_CACHE="$WORKSPACE/.cache/compile"
+
+mkdir -p "$LOCAL_CACHE/torch" "$LOCAL_CACHE/triton"
+mkdir -p "$NETWORK_CACHE/torch" "$NETWORK_CACHE/triton"
+
+# Restore from network volume if exists (fast startup after first run)
+if [ -d "$NETWORK_CACHE/torch" ] && [ "$(ls -A $NETWORK_CACHE/torch 2>/dev/null)" ]; then
+    echo ">>> Restoring torch compile cache from network volume..."
+    cp -r "$NETWORK_CACHE/torch/"* "$LOCAL_CACHE/torch/" 2>/dev/null || true
+fi
+if [ -d "$NETWORK_CACHE/triton" ] && [ "$(ls -A $NETWORK_CACHE/triton 2>/dev/null)" ]; then
+    echo ">>> Restoring triton cache from network volume..."
+    cp -r "$NETWORK_CACHE/triton/"* "$LOCAL_CACHE/triton/" 2>/dev/null || true
+fi
+
+# Point compilers at local storage
+export TORCH_COMPILE_CACHE_DIR="$LOCAL_CACHE/torch"
+export TORCHINDUCTOR_CACHE_DIR="$LOCAL_CACHE/torch"
+export TRITON_CACHE_DIR="$LOCAL_CACHE/triton"
+
+echo "✓ Compile caches: $LOCAL_CACHE (local) ↔ $NETWORK_CACHE (persistent)"
+
+# ============================================================================
+# NCCL TIMEOUT - Prevent false deadlock detection during long compiles
+# ============================================================================
+
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800  # 30 min (default is 480s)
+export NCCL_TIMEOUT=1800
 
 # ============================================================================
 # ACTIVATE VENV
@@ -56,7 +94,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "========================================"
-echo "GRPO Training Launch"
+echo "GRPO Training Launch (Optimized)"
 echo "========================================"
 echo "Model: $MODEL"
 echo "vLLM:  $USE_VLLM"
@@ -88,56 +126,67 @@ else
 fi
 echo ""
 
-# Cleanup function
+# ============================================================================
+# CLEANUP - Save compile cache on exit (normal or error)
+# ============================================================================
+
 cleanup() {
+    local exit_code=$?
     echo ""
-    echo "Shutting down..."
+    echo ">>> Saving compile caches to network volume..."
+    cp -r "$LOCAL_CACHE/torch/"* "$NETWORK_CACHE/torch/" 2>/dev/null || true
+    cp -r "$LOCAL_CACHE/triton/"* "$NETWORK_CACHE/triton/" 2>/dev/null || true
+    echo "✓ Caches saved"
+    
     if [[ -n "$VLLM_PID" ]]; then
+        echo ">>> Shutting down vLLM server..."
         kill $VLLM_PID 2>/dev/null || true
     fi
+    
+    exit $exit_code
 }
 trap cleanup EXIT
 
 # ============================================================================
-# MODEL PRE-DOWNLOAD
+# MODEL CACHE CHECK (skip download if already cached)
 # ============================================================================
 
-echo ">>> Pre-downloading model if not cached: $MODEL"
-python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$MODEL', cache_dir='$HF_HOME')"
-if [ $? -eq 0 ]; then
-    echo "Model ready in cache"
+MODEL_CACHE_NAME="${MODEL//\//-}"
+MODEL_CACHE_DIR="$HF_HOME/hub/models--$MODEL_CACHE_NAME"
+
+if [ -d "$MODEL_CACHE_DIR" ]; then
+    echo "✓ Model already cached: $MODEL_CACHE_DIR"
 else
-    echo "ERROR: Failed to prepare model. Check network, HF_TOKEN, and model access."
-    exit 1
+    echo ">>> Downloading model (first run only): $MODEL"
+    python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$MODEL', cache_dir='$HF_HOME')"
+    if [ $? -ne 0 ]; then
+        echo "ERROR: Failed to download model. Check network, HF_TOKEN, and model access."
+        exit 1
+    fi
 fi
 echo ""
 
 # ============================================================================
-# VLLM SERVER STARTUP
+# PARALLEL STARTUP: vLLM + Training load models simultaneously
 # ============================================================================
+
 if $USE_VLLM; then
-    echo ">>> Starting vLLM server on GPU 3..."
-    CUDA_VISIBLE_DEVICES=3 trl vllm-serve --model "$MODEL" --port $VLLM_PORT --max-model-len $MAX_MODEL_LENGTH &
+    echo ">>> Starting vLLM server on GPU 3 (background)..."
+    echo "    --enforce-eager: skip CUDA graph compilation for faster startup"
+    CUDA_VISIBLE_DEVICES=3 trl vllm-serve \
+        --model "$MODEL" \
+        --port $VLLM_PORT \
+        --max-model-len $MAX_MODEL_LENGTH \
+        --enforce-eager &
     VLLM_PID=$!
     
-    # Wait for vLLM to be ready
-    echo ">>> Waiting for vLLM server to start..."
-    MAX_WAIT=900
-    WAITED=0
-    while ! curl -s "http://localhost:$VLLM_PORT/health" > /dev/null 2>&1; do
-        sleep 2
-        WAITED=$((WAITED + 2))
-        if [[ $WAITED -ge $MAX_WAIT ]]; then
-            echo "ERROR: vLLM server failed to start within ${MAX_WAIT}s"
-            exit 1
-        fi
-        echo "    Waiting... (${WAITED}s)"
-    done
-    echo "✓ vLLM server ready"
+    # NO WAIT HERE - training starts immediately
+    # train.py will wait for vLLM after DeepSpeed init completes
     
-    # Launch training on GPUs 0-2
+    echo ">>> Launching training on GPUs 0-2 (parallel with vLLM startup)..."
+    echo "    Training will wait for vLLM after model initialization"
     echo ""
-    echo ">>> Launching training on GPUs 0-2..."
+    
     CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch \
         --config_file "$SCRIPT_DIR/accelerate_config.yaml" \
         --num_processes 3 \
