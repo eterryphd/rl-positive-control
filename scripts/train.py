@@ -44,7 +44,7 @@ if 'HF_HOME' not in os.environ:
 if 'PIP_CACHE_DIR' not in os.environ:
     os.environ['PIP_CACHE_DIR'] = '/workspace/.cache/pip'
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from datasets import Dataset
 import trl
@@ -297,6 +297,17 @@ def find_latest_checkpoint(output_dir: Path) -> str | None:
     return None
 
 
+class CheckpointCleanupCallback(TrainerCallback):
+    """Clean up old checkpoints after each save."""
+    
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+    
+    def on_save(self, args, state, control, **kwargs):
+        """Called after checkpoint is saved."""
+        cleanup_checkpoints(self.output_dir)
+
+
 # ============================================================================
 # TRAINING
 # ============================================================================
@@ -399,6 +410,9 @@ def train(args):
         train_dataset=train_dataset,
         processing_class=tokenizer,
     )
+    
+    # Add checkpoint cleanup callback
+    trainer.add_callback(CheckpointCleanupCallback(output_dir))
     
     init_elapsed = time.time() - init_start
     print(f"✓ Trainer initialized ({init_elapsed:.0f}s)")
