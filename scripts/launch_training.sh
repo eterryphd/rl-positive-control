@@ -84,7 +84,7 @@ sys.exit(0)
 echo ">>> Validating compile caches..."
 if ! validate_cache "$NETWORK_CACHE"; then
     echo "    Network cache corrupted, clearing..."
-    rm -rf "$NETWORK_CACHE"/*
+    rm -rf "$NETWORK_CACHE"
     mkdir -p "$NETWORK_CACHE/torch" "$NETWORK_CACHE/triton"
 fi
 
@@ -96,6 +96,13 @@ fi
 if ! validate_cache "$HOME/.cache/triton"; then
     echo "    ~/.cache/triton corrupted, clearing..."
     rm -rf "$HOME/.cache/triton"
+fi
+
+# Also clear local cache if network was corrupt (it was restored from corrupt source)
+if [ ! -d "$NETWORK_CACHE/torch" ] || [ ! -d "$NETWORK_CACHE/triton" ]; then
+    echo "    Clearing local cache too..."
+    rm -rf "$LOCAL_CACHE"
+    mkdir -p "$LOCAL_CACHE/torch" "$LOCAL_CACHE/triton"
 fi
 
 # Restore from network volume if exists (fast startup after first run)
