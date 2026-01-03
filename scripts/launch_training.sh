@@ -81,11 +81,21 @@ sys.exit(0)
 }
 
 # Validate network cache before restoring
-echo ">>> Validating network compile caches..."
+echo ">>> Validating compile caches..."
 if ! validate_cache "$NETWORK_CACHE"; then
     echo "    Network cache corrupted, clearing..."
     rm -rf "$NETWORK_CACHE"/*
     mkdir -p "$NETWORK_CACHE/torch" "$NETWORK_CACHE/triton"
+fi
+
+# Validate DeepSpeed's triton caches (separate from our managed cache)
+if ! validate_cache "$HOME/.triton"; then
+    echo "    ~/.triton cache corrupted, clearing..."
+    rm -rf "$HOME/.triton"
+fi
+if ! validate_cache "$HOME/.cache/triton"; then
+    echo "    ~/.cache/triton corrupted, clearing..."
+    rm -rf "$HOME/.cache/triton"
 fi
 
 # Restore from network volume if exists (fast startup after first run)
