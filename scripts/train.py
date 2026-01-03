@@ -236,25 +236,64 @@ def get_checkpoints(output_dir: Path) -> list:
 
 
 def cleanup_checkpoints(output_dir: Path):
-    """Keep only: first, second-to-last, and last checkpoint."""
+    """Keep only: first, second-to-last, and last valid checkpoint. Remove invalid ones."""
     checkpoints = get_checkpoints(output_dir)
     
-    if len(checkpoints) <= 3:
+    # First, remove any invalid checkpoints
+    valid_checkpoints = []
+    for step, path in checkpoints:
+        if validate_checkpoint(path):
+            valid_checkpoints.append((step, path))
+        else:
+            print(f"    Removing invalid checkpoint: {path.name}")
+            shutil.rmtree(path)
+    
+    if len(valid_checkpoints) <= 3:
         return
     
-    keep_indices = {0, len(checkpoints) - 2, len(checkpoints) - 1}
+    keep_indices = {0, len(valid_checkpoints) - 2, len(valid_checkpoints) - 1}
     
-    for i, (step, path) in enumerate(checkpoints):
+    for i, (step, path) in enumerate(valid_checkpoints):
         if i not in keep_indices:
             print(f"    Removing old checkpoint: {path.name}")
             shutil.rmtree(path)
 
 
+def validate_checkpoint(checkpoint_path: Path) -> bool:
+    """Check if checkpoint has all required files for resumption."""
+    required_files = [
+        'trainer_state.json',  # Training state
+    ]
+    
+    for f in required_files:
+        if not (checkpoint_path / f).exists():
+            return False
+    
+    # Check for at least one model/optimizer shard
+    has_model_files = any(
+        checkpoint_path.glob('*.safetensors')
+    ) or any(
+        checkpoint_path.glob('*.bin')
+    ) or (checkpoint_path / 'pytorch_model.bin').exists()
+    
+    # For DeepSpeed, check for ZeRO checkpoint
+    has_deepspeed = (checkpoint_path / 'zero_to_fp32.py').exists() or \
+                    any(checkpoint_path.glob('global_step*'))
+    
+    return has_model_files or has_deepspeed
+
+
 def find_latest_checkpoint(output_dir: Path) -> str | None:
-    """Find latest checkpoint for resumption."""
+    """Find latest valid checkpoint for resumption."""
     checkpoints = get_checkpoints(output_dir)
-    if checkpoints:
-        return str(checkpoints[-1][1])
+    
+    # Try checkpoints from newest to oldest
+    for step, path in reversed(checkpoints):
+        if validate_checkpoint(path):
+            return str(path)
+        else:
+            print(f"    Warning: Checkpoint {path.name} is incomplete, skipping...")
+    
     return None
 
 
