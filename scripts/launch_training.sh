@@ -64,18 +64,23 @@ export TRITON_CACHE_DIR="$LOCAL_CACHE/triton"
 echo "✓ Compile caches: $LOCAL_CACHE (local) ↔ $NETWORK_CACHE (persistent)"
 
 # ============================================================================
-# NCCL TIMEOUT - Prevent false deadlock detection during long compiles
+# NCCL CONFIG - Fix mixed P2P/SHM topology issues across NUMA nodes
 # ============================================================================
 
+export NCCL_P2P_DISABLE=1  # Force consistent SHM communication
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800  # 30 min (default is 480s)
 export NCCL_TIMEOUT=1800
 
 # ============================================================================
-# DEBUG LOGGING - Verbose output to diagnose hangs
+# DISABLE TORCH COMPILE - Skip compilation overhead entirely
 # ============================================================================
 
-export TORCH_LOGS="dynamo,inductor"
-export TORCHDYNAMO_VERBOSE=1
+export TORCH_COMPILE_DISABLE=1  # Global kill switch for torch.compile
+
+# ============================================================================
+# DEBUG LOGGING - Verbose output to diagnose issues
+# ============================================================================
+
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
 export NCCL_DEBUG=INFO
 
