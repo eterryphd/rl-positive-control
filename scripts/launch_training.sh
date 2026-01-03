@@ -82,10 +82,35 @@ sys.exit(0)
 
 # Validate network cache before restoring
 echo ">>> Validating compile caches..."
+CACHE_CORRUPTED=false
+
 if ! validate_cache "$NETWORK_CACHE"; then
-    echo "    Network cache corrupted, clearing..."
+    echo "    Network cache corrupted..."
+    CACHE_CORRUPTED=true
+fi
+
+if ! validate_cache "$LOCAL_CACHE"; then
+    echo "    Local cache corrupted..."
+    CACHE_CORRUPTED=true
+fi
+
+if [ "$CACHE_CORRUPTED" = true ]; then
+    echo "    Clearing all compile caches..."
     rm -rf "$NETWORK_CACHE"
+    rm -rf "$LOCAL_CACHE"
+    rm -rf "$HOME/.triton"
+    rm -rf "$HOME/.cache/triton"
+    rm -rf /tmp/triton*
+    rm -rf /tmp/torchinductor*
     mkdir -p "$NETWORK_CACHE/torch" "$NETWORK_CACHE/triton"
+    mkdir -p "$LOCAL_CACHE/torch" "$LOCAL_CACHE/triton"
+    
+    # Verify clearing worked
+    if ! validate_cache "$NETWORK_CACHE" || ! validate_cache "$LOCAL_CACHE"; then
+        echo "    ERROR: Failed to clear corrupt caches!"
+        exit 1
+    fi
+    echo "    ✓ Caches cleared successfully"
 fi
 
 # Validate DeepSpeed's triton caches (separate from our managed cache)
@@ -98,12 +123,15 @@ if ! validate_cache "$HOME/.cache/triton"; then
     rm -rf "$HOME/.cache/triton"
 fi
 
-# Also clear local cache if network was corrupt (it was restored from corrupt source)
-if [ ! -d "$NETWORK_CACHE/torch" ] || [ ! -d "$NETWORK_CACHE/triton" ]; then
-    echo "    Clearing local cache too..."
-    rm -rf "$LOCAL_CACHE"
-    mkdir -p "$LOCAL_CACHE/torch" "$LOCAL_CACHE/triton"
-fi
+# Check for any other triton caches in /tmp
+for dir in /tmp/triton*; do
+    if [ -d "$dir" ]; then
+        if ! validate_cache "$dir"; then
+            echo "    $dir corrupted, clearing..."
+            rm -rf "$dir"
+        fi
+    fi
+done
 
 # Restore from network volume if exists (fast startup after first run)
 if [ -d "$NETWORK_CACHE/torch" ] && [ "$(ls -A $NETWORK_CACHE/torch 2>/dev/null)" ]; then
@@ -194,16 +222,22 @@ fi
 echo ""
 
 # ============================================================================
-# CLEANUP - Save compile cache on exit (normal or error)
+# CLEANUP - Save compile cache on exit (only if successful)
 # ============================================================================
 
 cleanup() {
     local exit_code=$?
     echo ""
-    echo ">>> Saving compile caches to network volume..."
-    cp -r "$LOCAL_CACHE/torch/"* "$NETWORK_CACHE/torch/" 2>/dev/null || true
-    cp -r "$LOCAL_CACHE/triton/"* "$NETWORK_CACHE/triton/" 2>/dev/null || true
-    echo "✓ Caches saved"
+    
+    # Only save caches if training was successful (exit code 0)
+    if [ $exit_code -eq 0 ]; then
+        echo ">>> Saving compile caches to network volume..."
+        cp -r "$LOCAL_CACHE/torch/"* "$NETWORK_CACHE/torch/" 2>/dev/null || true
+        cp -r "$LOCAL_CACHE/triton/"* "$NETWORK_CACHE/triton/" 2>/dev/null || true
+        echo "✓ Caches saved"
+    else
+        echo ">>> Skipping cache save (non-zero exit code: $exit_code)"
+    fi
     
     if [[ -n "$VLLM_PID" ]]; then
         echo ">>> Shutting down vLLM server..."
