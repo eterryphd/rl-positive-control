@@ -46,6 +46,48 @@ NETWORK_CACHE="$WORKSPACE/.cache/compile"
 mkdir -p "$LOCAL_CACHE/torch" "$LOCAL_CACHE/triton"
 mkdir -p "$NETWORK_CACHE/torch" "$NETWORK_CACHE/triton"
 
+# Validate cache function - checks pickle and json files aren't corrupted
+validate_cache() {
+    python3 -c "
+import pickle
+from pathlib import Path
+import sys
+import json
+
+cache_dir = Path('$1')
+if not cache_dir.exists():
+    sys.exit(0)
+
+# Check pickle files (triton, some torch)
+for f in cache_dir.rglob('*.pkl'):
+    try:
+        with open(f, 'rb') as fh:
+            pickle.load(fh)
+    except:
+        print(f'    Corrupt pickle: {f}')
+        sys.exit(1)
+
+# Check json files (torch inductor)
+for f in cache_dir.rglob('*.json'):
+    try:
+        with open(f, 'r') as fh:
+            json.load(fh)
+    except:
+        print(f'    Corrupt json: {f}')
+        sys.exit(1)
+
+sys.exit(0)
+"
+}
+
+# Validate network cache before restoring
+echo ">>> Validating network compile caches..."
+if ! validate_cache "$NETWORK_CACHE"; then
+    echo "    Network cache corrupted, clearing..."
+    rm -rf "$NETWORK_CACHE"/*
+    mkdir -p "$NETWORK_CACHE/torch" "$NETWORK_CACHE/triton"
+fi
+
 # Restore from network volume if exists (fast startup after first run)
 if [ -d "$NETWORK_CACHE/torch" ] && [ "$(ls -A $NETWORK_CACHE/torch 2>/dev/null)" ]; then
     echo ">>> Restoring torch compile cache from network volume..."
