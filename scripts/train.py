@@ -56,7 +56,8 @@ import trl
 CONFIG = {
     # Prompt configuration - MUST MATCH evaluate.py
     'system_message': "You are a calculator. Output only the number.",
-    'max_new_tokens': 128,  # Longer to match interleaving needs
+    'max_new_tokens': 4096,  # Interleaved output needs ~1000 tokens + buffer
+    'max_prompt_length': 2048,  # Full texts + instructions ~1200 tokens
     
     # Generation
     'temperature': 0.9,  # More diversity for reward variance
@@ -300,7 +301,7 @@ def train(args):
         'gradient_accumulation_steps': CONFIG['gradient_accumulation_steps'],
         'num_generations': CONFIG['num_generations'],
         'max_completion_length': CONFIG['max_new_tokens'],
-        'max_prompt_length': 256,  # Arithmetic prompts are short
+        'max_prompt_length': CONFIG['max_prompt_length'],
         'temperature': CONFIG['temperature'],  # Diversity for reward variance
         'max_steps': CONFIG['max_steps'],
         'logging_steps': CONFIG['logging_steps'],
@@ -316,7 +317,6 @@ def train(args):
         'gradient_checkpointing_kwargs': {'use_reentrant': False},  # Fix for shape mismatch
         'remove_unused_columns': False,  # Keep 'answer' column for reward fn
         'report_to': 'none',  # Disable wandb unless you want it
-        'torch_compile': False,  # Skip compile - saves 10+ min startup on cold cache
     }
     
     # Add vLLM config if enabled

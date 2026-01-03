@@ -72,17 +72,11 @@ export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800  # 30 min (default is 480s)
 export NCCL_TIMEOUT=1800
 
 # ============================================================================
-# DISABLE TORCH COMPILE - Skip compilation overhead entirely
+# DEBUG LOGGING - Can disable once stable
 # ============================================================================
 
-export TORCH_COMPILE_DISABLE=1  # Global kill switch for torch.compile
-
-# ============================================================================
-# DEBUG LOGGING - Verbose output to diagnose issues
-# ============================================================================
-
-export TORCH_DISTRIBUTED_DEBUG=DETAIL
-export NCCL_DEBUG=INFO
+# export TORCH_DISTRIBUTED_DEBUG=DETAIL
+# export NCCL_DEBUG=INFO
 
 # ============================================================================
 # ACTIVATE VENV
