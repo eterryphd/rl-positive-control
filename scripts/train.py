@@ -298,14 +298,16 @@ def find_latest_checkpoint(output_dir: Path) -> str | None:
 
 
 class CheckpointCleanupCallback(TrainerCallback):
-    """Clean up old checkpoints after each save."""
+    """Clean up old checkpoints after each save. Only runs on main process."""
     
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
     
     def on_save(self, args, state, control, **kwargs):
         """Called after checkpoint is saved."""
-        cleanup_checkpoints(self.output_dir)
+        # Only run cleanup on main process to avoid race conditions
+        if state.is_world_process_zero:
+            cleanup_checkpoints(self.output_dir)
 
 
 # ============================================================================
