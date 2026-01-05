@@ -6,10 +6,10 @@ Saves full prompt and response for each problem for reproducibility.
 
 Usage:
     # Evaluate base model
-    python evaluate.py --model meta-llama/Llama-3.2-3B-Instruct
+    python evaluate.py --model meta-llama/Llama-3.1-8B-Instruct
     
-    # Evaluate trained checkpoint
-    python evaluate.py --checkpoint checkpoints/step_1000.pt
+    # Evaluate trained checkpoint (HuggingFace directory)
+    python evaluate.py --checkpoint /workspace/checkpoints/checkpoint-100
 
 Manual validation (paste into HuggingFace chat):
     System message: You are a calculator. Output only the number.
@@ -36,7 +36,7 @@ from tqdm import tqdm
 # ============================================================================
 # CONFIG - User configurable settings
 # ============================================================================
-
+#et
 CONFIG = {
     # Prompt configuration
     'system_message': "You are a calculator. Output only the number.",
@@ -121,21 +121,32 @@ def evaluate_single(model, tokenizer, problem: dict, device: str) -> dict:
 
 
 def load_model(model_name: str = None, checkpoint_path: str = None, device: str = 'cuda'):
-    """Load model from HuggingFace or checkpoint."""
+    """Load model from HuggingFace or checkpoint directory."""
     
     if checkpoint_path:
+        checkpoint_path = Path(checkpoint_path)
         print(f"Loading checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        base_model = checkpoint.get('base_model')
-        if not base_model:
-            raise ValueError("Checkpoint missing 'base_model' field")
         
+        # HuggingFace checkpoint directory (from Trainer/GRPO)
         model = AutoModelForCausalLM.from_pretrained(
-            base_model,
+            checkpoint_path,
             torch_dtype=torch.bfloat16,
         ).to(device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
+        
+        # Try to load tokenizer from checkpoint, fall back to base model
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+        except:
+            # Checkpoint may not have tokenizer - get from config
+            config_path = checkpoint_path / "config.json"
+            if config_path.exists():
+                with open(config_path) as f:
+                    config = json.load(f)
+                base_model = config.get("_name_or_path", "meta-llama/Llama-3.1-8B-Instruct")
+                print(f"  Loading tokenizer from base model: {base_model}")
+                tokenizer = AutoTokenizer.from_pretrained(base_model)
+            else:
+                raise ValueError(f"Cannot determine tokenizer for checkpoint {checkpoint_path}")
         
     else:
         print(f"Loading base model: {model_name}")
@@ -186,7 +197,7 @@ def evaluate_dataset(model, tokenizer, dataset: list, device: str) -> dict:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, help='HuggingFace model name')
-    parser.add_argument('--checkpoint', type=str, help='Path to checkpoint')
+    parser.add_argument('--checkpoint', type=str, help='Path to checkpoint directory')
     parser.add_argument('--dataset', type=str, default='test', 
                         choices=['train', 'val', 'test'])
     parser.add_argument('--device', type=str, default='cuda')
@@ -221,7 +232,7 @@ def main():
     
     output = {
         'metadata': {
-            'model': model_identifier,
+            'model': str(model_identifier),
             'dataset': args.dataset,
             'timestamp': datetime.now().isoformat(),
             'system_message': SYSTEM_MESSAGE,
@@ -240,7 +251,11 @@ def main():
     output_dir = Path(CONFIG['results_dir'])
     output_dir.mkdir(exist_ok=True)
     
-    model_name = Path(model_identifier).stem if args.checkpoint else args.model.split('/')[-1]
+    if args.checkpoint:
+        model_name = Path(args.checkpoint).name
+    else:
+        model_name = args.model.split('/')[-1]
+    
     output_file = output_dir / f"eval_{model_name}_{args.dataset}_{datetime.now():%Y%m%d_%H%M%S}.json"
     
     with open(output_file, 'w') as f:
