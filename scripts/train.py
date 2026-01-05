@@ -69,10 +69,10 @@ CONFIG = {
     'per_device_train_batch_size': 1,
     'gradient_accumulation_steps': 8,
     'max_steps': 200,
-    'logging_steps': 10,
+    'logging_steps': 1,
     # NOTE: save_steps set high - RewardThresholdSaveCallback handles saving
     # based on reward threshold (>0.3) or new best
-    'save_steps': 999999,
+    'save_steps': 20,
     
     # GRPO specific
     'beta': 0.0,  # KL penalty - 0.0 is now standard (no ref model needed)
