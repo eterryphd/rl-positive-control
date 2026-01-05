@@ -18,6 +18,8 @@
 #   HF_TOKEN=hf_xxxx bash launch_training.sh
 
 set -e
+# print out date and time training started
+echo "Training started: $(date)"
 
 # Defaults
 MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
