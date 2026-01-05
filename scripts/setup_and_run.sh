@@ -91,7 +91,8 @@ else
     echo "✓ Created and activated new venv"
     SKIP_INSTALL=0
 fi
-
+# After creating/activating venv
+echo 'source /workspace/venv/bin/activate' >> ~/.bashrc
 # ============================================================================
 # INSTALL DEPENDENCIES WITH PINNED VERSIONS
 # ============================================================================

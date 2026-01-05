@@ -68,11 +68,11 @@ CONFIG = {
     'num_train_epochs': 1,
     'per_device_train_batch_size': 1,
     'gradient_accumulation_steps': 8,
-    'max_steps': 100,
+    'max_steps': 200,
     'logging_steps': 10,
-    # NOTE: save_steps=10 for spot instance safety (~10-12 min between saves)
-    # Increase to 25-50 for on-demand instances to reduce I/O overhead
-    'save_steps': 10,
+    # NOTE: save_steps set high - RewardThresholdSaveCallback handles saving
+    # based on reward threshold (>0.3) or new best
+    'save_steps': 999999,
     
     # GRPO specific
     'beta': 0.0,  # KL penalty - 0.0 is now standard (no ref model needed)
@@ -310,6 +310,36 @@ class CheckpointCleanupCallback(TrainerCallback):
             cleanup_checkpoints(self.output_dir)
 
 
+class RewardThresholdSaveCallback(TrainerCallback):
+    """
+    Only save checkpoints when reward exceeds threshold or is new best.
+    
+    This prevents filling disk with mediocre checkpoints while ensuring
+    we capture good training states.
+    """
+    
+    def __init__(self, threshold: float = 0.3):
+        self.threshold = threshold
+        self.best_reward = float('-inf')
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        
+        reward = logs.get('reward', None)
+        if reward is None:
+            return
+        
+        # Save if above threshold OR new best
+        if reward > self.threshold or reward > self.best_reward:
+            if reward > self.best_reward:
+                self.best_reward = reward
+                print(f">>> New best reward: {reward:.3f} - saving checkpoint")
+            else:
+                print(f">>> Reward {reward:.3f} > {self.threshold} threshold - saving checkpoint")
+            control.should_save = True
+
+
 # ============================================================================
 # TRAINING
 # ============================================================================
@@ -358,7 +388,8 @@ def train(args):
         'max_steps': CONFIG['max_steps'],
         'logging_steps': CONFIG['logging_steps'],
         'save_steps': CONFIG['save_steps'],
-        'save_total_limit': 3,  # Keep only last 2 checkpoints (~50GB each)
+        'lr_scheduler_type': 'constant',  # No decay - let Adam handle adaptation
+        # Keeping all checkpoints - identify best by validation later
         # NOTE: save_only_model=False required for DeepSpeed resume on spot pods
         # Checkpoints are larger but can actually resume training
         'save_only_model': False,
@@ -413,8 +444,8 @@ def train(args):
         processing_class=tokenizer,
     )
     
-    # Add checkpoint cleanup callback
-    trainer.add_callback(CheckpointCleanupCallback(output_dir))
+    # Add reward-based checkpoint saving
+    trainer.add_callback(RewardThresholdSaveCallback(threshold=0.3))
     
     init_elapsed = time.time() - init_start
     print(f"✓ Trainer initialized ({init_elapsed:.0f}s)")
@@ -430,9 +461,8 @@ def train(args):
     
     trainer.train(resume_from_checkpoint=resume_from)
     
-    # Clean up old checkpoints
-    print("\nCleaning up checkpoints...")
-    cleanup_checkpoints(output_dir)
+    # Keeping all checkpoints for analysis
+    # cleanup_checkpoints(output_dir)
     
     # Training complete - final checkpoint is already saved by trainer
     print("\n" + "=" * 70)
