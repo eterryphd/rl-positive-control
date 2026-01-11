@@ -296,7 +296,8 @@ if $USE_VLLM; then
         "$SCRIPT_DIR/train.py" \
         --model "$MODEL" \
         --use-vllm \
-        --vllm-port $VLLM_PORT
+        --vllm-port $VLLM_PORT \
+        --dynamic_data #added by Eric per grok's instructions
 else
     echo ">>> Launching training on all 4 GPUs (no vLLM)..."
     
