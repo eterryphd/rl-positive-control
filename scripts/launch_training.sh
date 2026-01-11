@@ -1,114 +1,317 @@
 #!/bin/bash
 # launch_training.sh
-# Script to launch GRPO training with optimized cache handling
+#
+# One-command launcher for GRPO training with vLLM
+# 
+# OPTIMIZATIONS:
+#   1. Parallel model loading - vLLM and DeepSpeed init simultaneously
+#   2. Local compile cache - fast I/O during torch.compile, synced to network volume
+#   3. --enforce-eager on vLLM - skip CUDA graph compilation
+#   4. Extended NCCL timeout - prevent false deadlock detection during compile
+#
+# For spot pods with auto-restart, use startup.sh instead.
+#
+# Usage:
+#   bash launch_training.sh [--model MODEL] [--no-vllm]
+#
+# With HF_TOKEN:
+#   HF_TOKEN=hf_xxxx bash launch_training.sh
 
-# ==============================================================================
-# CONFIG
-# ==============================================================================
-# Cache directories - use local SSD for speed, network volume for persistence
-LOCAL_CACHE_DIR="/tmp/cache"
-NETWORK_CACHE_DIR="/workspace/cache"
+set -e
+# print out date and time training started
+echo "Training started: $(date)"
 
-# Triton/Torch compile caches - these are large and frequently accessed
-TRITON_CACHE_DIR="${LOCAL_CACHE_DIR}/triton"
-TORCH_CACHE_DIR="${LOCAL_CACHE_DIR}/torch"
+# Defaults
+MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+USE_VLLM=true
+VLLM_PORT=8000
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE="/workspace"
+VENV_DIR="$WORKSPACE/venv"
+MAX_MODEL_LENGTH=8192
 
-# Timeouts - prevent deadlocks
-export NCCL_IB_TIMEOUT=60
-export NCCL_IB_RETRY_COUNT=20
+# ============================================================================
+# CACHE DIRECTORIES - HF/pip on network volume (large, sequential reads OK)
+# ============================================================================
 
-# ==============================================================================
-# CACHE MANAGEMENT
-# ==============================================================================
+export HF_HOME="$WORKSPACE/.cache/huggingface"
+export PIP_CACHE_DIR="$WORKSPACE/.cache/pip"
+mkdir -p "$HF_HOME" "$PIP_CACHE_DIR"
 
-# Function to sync cache from network to local
-sync_cache() {
-    if [ -d "$NETWORK_CACHE_DIR" ]; then
-        echo ">>> Syncing cache from network volume..."
-        cp -r "$NETWORK_CACHE_DIR/"* "$LOCAL_CACHE_DIR/"  # Use cp if rsync unavailable
-    else
-        echo ">>> No network cache found, using fresh local cache"
-    fi
-}
+# ============================================================================
+# COMPILE CACHE - Local storage for speed, sync to network for persistence
+# ============================================================================
 
-# Function to validate cache integrity
+LOCAL_CACHE="/tmp/compile_cache"
+NETWORK_CACHE="$WORKSPACE/.cache/compile"
+
+mkdir -p "$LOCAL_CACHE/torch" "$LOCAL_CACHE/triton"
+mkdir -p "$NETWORK_CACHE/torch" "$NETWORK_CACHE/triton"
+
+# Validate cache function - checks pickle and json files aren't corrupted
 validate_cache() {
-    echo ">>> Validating cache integrity..."
-    
-    # Check for common corruption patterns
-    find "$LOCAL_CACHE_DIR" -type f \( -name "*.pickle" -o -name "*.json" \) -exec bash -c 'if ! python3 -c "import pickle; pickle.load(open(\"$0\", \"rb\"))" 2>/dev/null; then echo "Corrupt file: $0"; rm "$0"; fi' {} \; || true
-    
-    # If cache is empty or corrupt, we'll let compiles happen naturally
+    python3 -c "
+import pickle
+from pathlib import Path
+import sys
+import json
+
+cache_dir = Path('$1')
+if not cache_dir.exists():
+    sys.exit(0)
+
+# Check pickle files (triton, some torch)
+for f in cache_dir.rglob('*.pkl'):
+    try:
+        with open(f, 'rb') as fh:
+            pickle.load(fh)
+    except:
+        print(f'    Corrupt pickle: {f}')
+        sys.exit(1)
+
+# Check json files (torch inductor)
+for f in cache_dir.rglob('*.json'):
+    try:
+        with open(f, 'r') as fh:
+            json.load(fh)
+    except:
+        print(f'    Corrupt json: {f}')
+        sys.exit(1)
+
+sys.exit(0)
+"
 }
 
-# Function to sync back to network (on exit)
-sync_back() {
-    echo ">>> Syncing cache back to network volume..."
-    cp -r "$LOCAL_CACHE_DIR/"* "$NETWORK_CACHE_DIR/"  # Use cp if rsync unavailable
-}
+# Validate network cache before restoring
+echo ">>> Validating compile caches..."
+CACHE_CORRUPTED=false
 
-# Trap for cleanup
-trap sync_back EXIT
+if ! validate_cache "$NETWORK_CACHE"; then
+    echo "    Network cache corrupted..."
+    CACHE_CORRUPTED=true
+fi
 
-# Create directories
-mkdir -p "$LOCAL_CACHE_DIR" "$NETWORK_CACHE_DIR" "$TRITON_CACHE_DIR" "$TORCH_CACHE_DIR"
+if ! validate_cache "$LOCAL_CACHE"; then
+    echo "    Local cache corrupted..."
+    CACHE_CORRUPTED=true
+fi
 
-# Export cache env vars
-export TRITON_CACHE_DIR="$TRITON_CACHE_DIR"
-export TORCH_COMPILE_CACHE="$TORCH_CACHE_DIR"
+if [ "$CACHE_CORRUPTED" = true ]; then
+    echo "    Clearing all compile caches..."
+    rm -rf "$NETWORK_CACHE"
+    rm -rf "$LOCAL_CACHE"
+    rm -rf "$HOME/.triton"
+    rm -rf "$HOME/.cache/triton"
+    rm -rf /tmp/triton*
+    rm -rf /tmp/torchinductor*
+    mkdir -p "$NETWORK_CACHE/torch" "$NETWORK_CACHE/triton"
+    mkdir -p "$LOCAL_CACHE/torch" "$LOCAL_CACHE/triton"
+    
+    # Verify clearing worked
+    if ! validate_cache "$NETWORK_CACHE" || ! validate_cache "$LOCAL_CACHE"; then
+        echo "    ERROR: Failed to clear corrupt caches!"
+        exit 1
+    fi
+    echo "    ✓ Caches cleared successfully"
+fi
 
-# Sync and validate
-sync_cache
-validate_cache
+# Validate DeepSpeed's triton caches (separate from our managed cache)
+if ! validate_cache "$HOME/.triton"; then
+    echo "    ~/.triton cache corrupted, clearing..."
+    rm -rf "$HOME/.triton"
+fi
+if ! validate_cache "$HOME/.cache/triton"; then
+    echo "    ~/.cache/triton corrupted, clearing..."
+    rm -rf "$HOME/.cache/triton"
+fi
 
-# ==============================================================================
-# HF TOKEN CHECK
-# ==============================================================================
-if [ -z "$HF_TOKEN" ]; then
-    echo "✗ HF_TOKEN not set"
-    echo "  Set environment variable: export HF_TOKEN=hf_..."
+# Check for any other triton caches in /tmp
+for dir in /tmp/triton*; do
+    if [ -d "$dir" ]; then
+        if ! validate_cache "$dir"; then
+            echo "    $dir corrupted, clearing..."
+            rm -rf "$dir"
+        fi
+    fi
+done
+
+# Restore from network volume if exists (fast startup after first run)
+if [ -d "$NETWORK_CACHE/torch" ] && [ "$(ls -A $NETWORK_CACHE/torch 2>/dev/null)" ]; then
+    echo ">>> Restoring torch compile cache from network volume..."
+    cp -r "$NETWORK_CACHE/torch/"* "$LOCAL_CACHE/torch/" 2>/dev/null || true
+fi
+if [ -d "$NETWORK_CACHE/triton" ] && [ "$(ls -A $NETWORK_CACHE/triton 2>/dev/null)" ]; then
+    echo ">>> Restoring triton cache from network volume..."
+    cp -r "$NETWORK_CACHE/triton/"* "$LOCAL_CACHE/triton/" 2>/dev/null || true
+fi
+
+# Point compilers at local storage
+export TORCH_COMPILE_CACHE_DIR="$LOCAL_CACHE/torch"
+export TORCHINDUCTOR_CACHE_DIR="$LOCAL_CACHE/torch"
+export TRITON_CACHE_DIR="$LOCAL_CACHE/triton"
+
+echo "✓ Compile caches: $LOCAL_CACHE (local) ↔ $NETWORK_CACHE (persistent)"
+
+# ============================================================================
+# NCCL CONFIG - Fix mixed P2P/SHM topology issues across NUMA nodes
+# ============================================================================
+
+export NCCL_P2P_DISABLE=1  # Force consistent SHM communication
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800  # 30 min (default is 480s)
+export NCCL_TIMEOUT=1800
+
+# ============================================================================
+# DEBUG LOGGING - Can disable once stable
+# ============================================================================
+
+# export TORCH_DISTRIBUTED_DEBUG=DETAIL
+# export NCCL_DEBUG=INFO
+
+# ============================================================================
+# ACTIVATE VENV
+# ============================================================================
+
+if [ -d "$VENV_DIR" ] && [ -f "$VENV_DIR/bin/activate" ]; then
+    source "$VENV_DIR/bin/activate"
+    echo "✓ Activated venv: $VENV_DIR"
+else
+    echo "✗ No venv found at $VENV_DIR"
+    echo "  Run setup_and_run.sh first"
     exit 1
 fi
 
-# ==============================================================================
-# VLLM SERVER
-# ==============================================================================
-VLLM_HOST="0.0.0.0"
-VLLM_PORT=8000
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --model) MODEL="$2"; shift 2 ;;
+        --no-vllm) USE_VLLM=false; shift ;;
+        --port) VLLM_PORT="$2"; shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
 
-if [ "$1" != "--no-vllm" ]; then
-    echo ">>> Starting vLLM server on GPU 3..."
-    CUDA_VISIBLE_DEVICES=3 python -m vllm.entrypoints.openai.api_server \
-        --model meta-llama/Llama-3.1-8B-Instruct \
-        --host "$VLLM_HOST" \
-        --port "$VLLM_PORT" \
-        --tensor-parallel-size 1 \
-        --gpu-memory-utilization 0.95 &
+echo "========================================"
+echo "GRPO Training Launch (Optimized)"
+echo "========================================"
+echo "Model: $MODEL"
+echo "vLLM:  $USE_VLLM"
+echo ""
+
+# ============================================================================
+# HF_TOKEN CHECK
+# ============================================================================
+
+echo ">>> Checking HuggingFace authentication..."
+
+# Try loading from network volume first
+if [[ -z "$HF_TOKEN" ]] && [[ -f "$WORKSPACE/.cache/huggingface/token" ]]; then
+    export HF_TOKEN=$(cat "$WORKSPACE/.cache/huggingface/token")
+    echo "  Loaded HF_TOKEN from network volume"
+fi
+
+if [[ -n "$HF_TOKEN" ]]; then
+    echo "✓ Using HF_TOKEN"
+    export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+    mkdir -p ~/.cache/huggingface
+    echo -n "$HF_TOKEN" > ~/.cache/huggingface/token
+elif huggingface-cli whoami &>/dev/null; then
+    echo "✓ Already logged in to HuggingFace"
+else
+    echo "✗ Not authenticated with HuggingFace"
+    echo "  Either set HF_TOKEN or run: huggingface-cli login"
+    exit 1
+fi
+echo ""
+
+# ============================================================================
+# CLEANUP - Save compile cache on exit (only if successful)
+# ============================================================================
+
+cleanup() {
+    local exit_code=$?
+    echo ""
+    
+    # Only save caches if training was successful (exit code 0)
+    if [ $exit_code -eq 0 ]; then
+        echo ">>> Saving compile caches to network volume..."
+        cp -r "$LOCAL_CACHE/torch/"* "$NETWORK_CACHE/torch/" 2>/dev/null || true
+        cp -r "$LOCAL_CACHE/triton/"* "$NETWORK_CACHE/triton/" 2>/dev/null || true
+        echo "✓ Caches saved"
+    else
+        echo ">>> Skipping cache save (non-zero exit code: $exit_code)"
+    fi
+    
+    if [[ -n "$VLLM_PID" ]]; then
+        echo ">>> Shutting down vLLM server..."
+        kill $VLLM_PID 2>/dev/null || true
+    fi
+    
+    exit $exit_code
+}
+trap cleanup EXIT
+
+# ============================================================================
+# MODEL CACHE CHECK (skip download if already cached)
+# ============================================================================
+
+MODEL_CACHE_NAME="${MODEL//\//-}"
+MODEL_CACHE_DIR="$HF_HOME/hub/models--$MODEL_CACHE_NAME"
+
+if [ -d "$MODEL_CACHE_DIR" ]; then
+    echo "✓ Model already cached: $MODEL_CACHE_DIR"
+else
+    echo ">>> Downloading model (first run only): $MODEL"
+    python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$MODEL', cache_dir='$HF_HOME')"
+    if [ $? -ne 0 ]; then
+        echo "ERROR: Failed to download model. Check network, HF_TOKEN, and model access."
+        exit 1
+    fi
+fi
+echo ""
+
+# ============================================================================
+# PARALLEL STARTUP: vLLM + Training load models simultaneously
+# ============================================================================
+
+if $USE_VLLM; then
+    echo ">>> Starting vLLM server on GPU 3 (background)..."
+    echo "    --enforce-eager: skip CUDA graph compilation for faster startup"
+    CUDA_VISIBLE_DEVICES=3 trl vllm-serve \
+        --model "$MODEL" \
+        --port $VLLM_PORT \
+        --max-model-len $MAX_MODEL_LENGTH \
+        --enforce-eager &
     VLLM_PID=$!
+    
+    # NO WAIT HERE - training starts immediately
+    # train.py will wait for vLLM after DeepSpeed init completes
+    
+    echo ">>> Launching training on GPUs 0-2 (parallel with vLLM startup)..."
+    echo "    Training will wait for vLLM after model initialization"
+    echo ""
+    
+    CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch \
+        --config_file "$SCRIPT_DIR/accelerate_config.yaml" \
+        --num_processes 3 \
+        "$SCRIPT_DIR/train.py" \
+        --model "$MODEL" \
+        --use-vllm \
+        --vllm-port $VLLM_PORT
+else
+    echo ">>> Launching training on all 4 GPUs (no vLLM)..."
+    
+    # Modify accelerate config for 4 GPUs
+    sed 's/num_processes: 3/num_processes: 4/' "$SCRIPT_DIR/accelerate_config.yaml" > /tmp/accelerate_config_4gpu.yaml
+    
+    accelerate launch \
+        --config_file /tmp/accelerate_config_4gpu.yaml \
+        --num_processes 4 \
+        "$SCRIPT_DIR/train.py" \
+        --model "$MODEL" \
+        --no-vllm
 fi
 
-# ==============================================================================
-# MODEL DOWNLOAD (if not cached)
-# ==============================================================================
-echo ">>> Checking/downloading model..."
-python -c "from transformers import AutoModelForCausalLM; AutoModelForCausalLM.from_pretrained('meta-llama/Llama-3.1-8B-Instruct', token='$HF_TOKEN')"
-
-# ==============================================================================
-# LAUNCH TRAINING
-# ==============================================================================
-echo ">>> Launching training..."
-
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch \
-    --config_file accelerate_config.yaml \
-    --num_processes 3 \
-    train.py \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --dynamic_data  # Enable new dynamic data approach
-
-# Wait for training to complete
-wait
-
-# If vLLM was started, clean up
-if [ -n "$VLLM_PID" ]; then
-    kill $VLLM_PID
-fi
+echo ""
+echo "========================================"
+echo "Training complete!"
+echo "========================================"
