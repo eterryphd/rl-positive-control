@@ -35,7 +35,7 @@ import shutil
 import time
 import urllib.request
 from pathlib import Path
-from typing import Set
+from typing import Set, Optional
 
 # Set cache directories before importing HF libraries
 # This prevents filling up the root filesystem on Runpod
@@ -102,7 +102,7 @@ CONFIG = {
 # VLLM SERVER WAIT (for parallel loading optimization)
 # ============================================================================
 
-def wait_for_vllm(host: str, port: int, timeout: int = 1800, check_interval: int = 5):
+def wait_for_vllm(host: str = 'localhost', port: int = 8000, timeout: int = 1800, check_interval: int = 5):
     """
     Wait for vLLM server to be ready.
     
@@ -110,8 +110,8 @@ def wait_for_vllm(host: str, port: int, timeout: int = 1800, check_interval: int
     This saves 6-8 minutes compared to waiting before training starts.
     
     Args:
-        host: vLLM server host
-        port: vLLM server port
+        host: vLLM server host (default: localhost)
+        port: vLLM server port (default: 8000)
         timeout: Maximum seconds to wait (default 30 min to handle slow compiles)
         check_interval: Seconds between health checks
     
@@ -131,7 +131,7 @@ def wait_for_vllm(host: str, port: int, timeout: int = 1800, check_interval: int
         try:
             urllib.request.urlopen(url, timeout=5)
             elapsed = time.time() - start
-            print(f"vLLM server ready (waited {elapsed:.0f}s)")
+            print(f"✓ vLLM server ready (waited {elapsed:.0f}s)")
             return True
         except (urllib.error.URLError, urllib.error.HTTPError, OSError):
             elapsed = time.time() - start
@@ -166,10 +166,13 @@ def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
     rewards = []
     answers = kwargs.get('answer', [None] * len(prompts))
     
-    for completion, answer in zip(completions, answers):
+    for i, (completion, answer) in enumerate(zip(completions, answers)):
         predicted = extract_answer(completion)
         
         if predicted is None or answer is None:
+            # Log why extraction failed for debugging
+            if predicted is None:
+                print(f"    Warning: Could not extract answer from: '{completion[:100]}'")
             rewards.append(-1.0)
             continue
         
@@ -191,7 +194,7 @@ def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
 # DATA LOADING
 # ============================================================================
 
-def prepare_dataset(tokenizer, args, config: Dict) -> Dataset:
+def prepare_dataset(tokenizer, args, config: dict) -> Dataset:
     """Prepare dataset - static or dynamic based on flag."""
     if args.dynamic_data:
         print(">>> Dynamic data mode enabled - generating fresh dataset")
@@ -212,11 +215,15 @@ def prepare_dataset(tokenizer, args, config: Dict) -> Dataset:
             'answer': [p['answer'] for p in problems],
         }
         
+        print(f"    Generated {len(problems)} unique problems")
         return Dataset.from_dict(data)
     
     else:
         print(">>> Static data mode - loading from file")
-        data_path = Path(CONFIG['data_dir']) / 'train.json'
+        data_path = Path(config['data_dir']) / 'train.json'
+        
+        if not data_path.exists():
+            raise FileNotFoundError(f"Training data not found at {data_path}")
         
         with open(data_path) as f:
             problems = json.load(f)
@@ -227,6 +234,7 @@ def prepare_dataset(tokenizer, args, config: Dict) -> Dataset:
             'answer': [p['answer'] for p in problems],
         }
         
+        print(f"    Loaded {len(problems)} problems from {data_path}")
         return Dataset.from_dict(data)
 
 
@@ -250,7 +258,7 @@ def get_checkpoints(output_dir: Path) -> list:
 
 
 def cleanup_checkpoints(output_dir: Path):
-    """Keep only only: first, second-to-last, and last valid checkpoint. Remove invalid ones."""
+    """Keep only: first, second-to-last, and last valid checkpoint. Remove invalid ones."""
     checkpoints = get_checkpoints(output_dir)
     
     # First, remove any invalid checkpoints
@@ -297,7 +305,7 @@ def validate_checkpoint(checkpoint_path: Path) -> bool:
     return has_model_files or has_deepspeed
 
 
-def find_latest_checkpoint(output_dir: Path) -> str | None:
+def find_latest_checkpoint(output_dir: Path) -> Optional[str]:
     """Find latest valid checkpoint for resumption."""
     checkpoints = get_checkpoints(output_dir)
     
@@ -355,37 +363,51 @@ class RewardThresholdSaveCallback(TrainerCallback):
 
 
 class ValidationCallback(TrainerCallback):
-    """Periodic validation on held-out set."""
+    """
+    Periodic validation on held-out set.
     
-    def __init__(self, validation_size: int, validation_steps: int, generator: ProblemGenerator, tokenizer, model, config: Dict):
+    FIXED: Now properly tracks seen problems during training and generates
+    held-out validation problems that haven't been seen before.
+    """
+    
+    def __init__(self, validation_size: int, validation_steps: int, 
+                 generator: ProblemGenerator, tokenizer, config: dict):
         self.validation_size = validation_size
         self.validation_steps = validation_steps
         self.generator = generator
         self.tokenizer = tokenizer
-        self.model = model
         self.config = config
         self.seen_problems: Set[str] = set()
+        # Track which problems appear in the training dataset
+        self.initialized = False
     
-    def on_step_begin(self, args, state, control, **kwargs):
-        """Track seen problems if dynamic mode."""
-        if args.dynamic_data:
-            # Assuming batch problems are accessible - adjust based on trainer state
-            batch = kwargs.get('train_dataloader', None)  # Placeholder; implement based on actual access
-            if batch:
-                for problem in batch['problem']:
+    def on_train_begin(self, args, state, control, **kwargs):
+        """Capture initial training dataset problems."""
+        # Get access to the training dataset from trainer
+        trainer = kwargs.get('trainer', None)
+        if trainer and hasattr(trainer, 'train_dataset'):
+            dataset = trainer.train_dataset
+            if 'problem' in dataset.column_names:
+                for problem in dataset['problem']:
                     self.seen_problems.add(problem)
+                print(f">>> Validation: Tracking {len(self.seen_problems)} seen problems")
+                self.initialized = True
     
     def on_step_end(self, args, state, control, **kwargs):
-        """Validate every N steps."""
+        """Validate every N steps on held-out problems."""
         if state.global_step % self.validation_steps == 0 and state.is_world_process_zero:
-            print(f"    Validating at step {state.global_step}...")
+            print(f"\n    Validating at step {state.global_step}...")
             
-            # Generate held-out validation set
+            # Generate held-out validation set (problems not in training)
             val_problems = self.generator.generate_held_out(
                 self.validation_size,
                 self.seen_problems,
                 self.config.get('problem_config', {})
             )
+            
+            if not val_problems:
+                print("    Warning: Could not generate validation problems")
+                return
             
             # Prepare validation dataset
             val_data = {
@@ -395,24 +417,36 @@ class ValidationCallback(TrainerCallback):
             val_dataset = Dataset.from_dict(val_data)
             
             # Evaluate - generate completions and compute accuracy
+            trainer = kwargs.get('trainer', None)
+            if trainer is None or not hasattr(trainer, 'model'):
+                print("    Warning: Cannot access model for validation")
+                return
+            
+            model = trainer.model
+            device = model.device if hasattr(model, 'device') else 'cuda'
+            
             correct = 0
             for i in range(len(val_dataset)):
-                inputs = self.tokenizer(val_dataset['prompt'][i], return_tensors="pt").to(self.model.device)
-                with torch.no_grad():
-                    outputs = self.model.generate(
-                        **inputs,
-                        max_new_tokens=CONFIG['max_new_tokens'],
-                        do_sample=False,
-                    )
-                generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
-                response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-                predicted = extract_answer(response)
-                if predicted is not None and abs(predicted - val_dataset['answer'][i]) < 0.01:
-                    correct += 1
+                try:
+                    inputs = self.tokenizer(val_dataset['prompt'][i], return_tensors="pt").to(device)
+                    with torch.no_grad():
+                        outputs = model.generate(
+                            **inputs,
+                            max_new_tokens=CONFIG['max_new_tokens'],
+                            do_sample=False,
+                            pad_token_id=self.tokenizer.eos_token_id,
+                        )
+                    generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
+                    response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                    predicted = extract_answer(response)
+                    if predicted is not None and abs(predicted - val_dataset['answer'][i]) < 0.01:
+                        correct += 1
+                except Exception as e:
+                    print(f"      Error evaluating problem {i}: {e}")
+                    continue
             
             accuracy = correct / len(val_problems) if val_problems else 0
-            state.log_history.append({'val_accuracy': accuracy})
-            print(f"    Validation accuracy: {accuracy:.1%}")
+            print(f"    Validation accuracy: {accuracy:.1%} ({correct}/{len(val_problems)})")
 
 
 # ============================================================================
@@ -465,7 +499,6 @@ def train(args):
         'lr_scheduler_type': 'constant',  # No decay - let Adam handle adaptation
         # Keeping all checkpoints - identify best by validation later
         # NOTE: save_only_model=False required for DeepSpeed resume on spot pods
-        # Checkpoints are larger but
         'save_only_model': False,
     }
     
@@ -491,14 +524,16 @@ def train(args):
                 CONFIG['validation_steps'],
                 generator,
                 tokenizer,
-                # Model reference - note: this assumes model is accessible; adjust if needed for distributed
-                grpo_trainer.model if hasattr(grpo_trainer, 'model') else None,
                 CONFIG
             )
         ],
         resume_from_checkpoint=resume_from,
-        no_vllm=args.no_vllm,
     )
+    
+    # Wait for vLLM if using it
+    if not args.no_vllm:
+        print("\n>>> Trainer initialized, now waiting for vLLM server...")
+        wait_for_vllm(host='localhost', port=args.vllm_port)
     
     # Train
     print("\nStarting training...")
@@ -507,14 +542,17 @@ def train(args):
     print("\nTraining complete!")
     print(f"Final checkpoints in {output_dir}")
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, required=True, help='HuggingFace model name')
-    parser.add_argument('--no_vllm', action='store_true', help='Disable vLLM server mode')
-    parser.add_argument('--dynamic_data', action='store_true', help='Enable dynamic data generation')
+    parser.add_argument('--no-vllm', action='store_true', help='Disable vLLM server mode')
+    parser.add_argument('--vllm-port', type=int, default=8000, help='vLLM server port')
+    parser.add_argument('--dynamic-data', action='store_true', help='Enable dynamic data generation')
     args = parser.parse_args()
     
     train(args)
+
 
 if __name__ == "__main__":
     main()
