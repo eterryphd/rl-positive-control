@@ -26,17 +26,18 @@ Actual prompt after chat template (for debugging):
 
 import argparse
 import json
-import re
 import torch
 from datetime import datetime
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
+# Import centralized utility
+from utils import extract_answer
+
 # ============================================================================
 # CONFIG - User configurable settings
 # ============================================================================
-#et
 CONFIG = {
     # Prompt configuration
     'system_message': "You are a calculator. Output only the number.",
@@ -71,18 +72,6 @@ def build_prompt(problem: str, tokenizer) -> tuple[str, int]:
     )
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
     return prompt, input_ids.shape[1]
-
-
-def extract_answer(response: str):
-    """Extract numeric answer from model response."""
-    # Find all numbers (including negative and decimal)
-    numbers = re.findall(r'-?\d+\.?\d*', response)
-    if numbers:
-        try:
-            return float(numbers[0])  # Take first number
-        except ValueError:
-            return None
-    return None
 
 
 def evaluate_single(model, tokenizer, problem: dict, device: str) -> dict:
@@ -266,7 +255,7 @@ def main():
     # Show sample results
     print("\n=== Sample Results ===")
     for result in results['results'][:5]:
-        status = "✓" if result['is_correct'] else "✗"
+        status = "Correct" if result['is_correct'] else "Incorrect"
         print(f"{status} {result['problem']} = {result['correct_answer']}")
         print(f"   Model output: '{result['model_response']}' → parsed: {result['predicted_answer']}")
         print()

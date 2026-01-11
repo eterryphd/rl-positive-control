@@ -31,7 +31,6 @@ import argparse
 import json
 import math
 import os
-import re
 import shutil
 import time
 import urllib.request
@@ -48,6 +47,9 @@ from transformers import AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from datasets import Dataset
 import trl
+
+# Import centralized utility
+from utils import extract_answer
 
 # ============================================================================
 # CONFIG - User configurable settings
@@ -115,7 +117,7 @@ def wait_for_vllm(host: str, port: int, timeout: int = 1800, check_interval: int
         try:
             urllib.request.urlopen(url, timeout=5)
             elapsed = time.time() - start
-            print(f"✓ vLLM server ready (waited {elapsed:.0f}s)")
+            print(f"vLLM server ready (waited {elapsed:.0f}s)")
             return True
         except (urllib.error.URLError, urllib.error.HTTPError, OSError):
             elapsed = time.time() - start
@@ -132,23 +134,12 @@ def wait_for_vllm(host: str, port: int, timeout: int = 1800, check_interval: int
 # REWARD FUNCTION
 # ============================================================================
 
-def extract_answer(response: str):
-    """Extract numeric answer from model response."""
-    numbers = re.findall(r'-?\d+\.?\d*', response)
-    if numbers:
-        try:
-            return float(numbers[0])
-        except ValueError:
-            return None
-    return None
-
-
 def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
     """
     Compute rewards for completions using continuous relative error.
     
     Reward based on how close the answer is - exponential decay.
-    Perfect = +1.0, order of magnitude off ≈ -0.3, way off → -1.0
+    Perfect = +1.0, order of magnitude off approximately -0.3, way off to -1.0
     
     Args:
         prompts: List of prompt strings
@@ -171,7 +162,7 @@ def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
         # Relative error (add 1 to denominator to handle answer=0)
         relative_error = abs(predicted - answer) / (abs(answer) + 1)
         
-        # Exponential decay: perfect=1.0, 10% off≈0.6, 50% off≈0.08
+        # Exponential decay: perfect=1.0, 10% off approximately 0.6, 50% off approximately 0.08
         raw_reward = math.exp(-relative_error * 5)
         
         # Scale to [-1, 1]
@@ -236,7 +227,7 @@ def get_checkpoints(output_dir: Path) -> list:
 
 
 def cleanup_checkpoints(output_dir: Path):
-    """Keep only: first, second-to-last, and last valid checkpoint. Remove invalid ones."""
+    """Keep only only: first, second-to-last, and last valid checkpoint. Remove invalid ones."""
     checkpoints = get_checkpoints(output_dir)
     
     # First, remove any invalid checkpoints
@@ -345,7 +336,6 @@ class RewardThresholdSaveCallback(TrainerCallback):
 # ============================================================================
 
 def train(args):
-    """Main training function."""
     print("=" * 70)
     print("GRPO TRAINING - ARITHMETIC POSITIVE CONTROL")
     print("=" * 70)
@@ -391,105 +381,39 @@ def train(args):
         'lr_scheduler_type': 'constant',  # No decay - let Adam handle adaptation
         # Keeping all checkpoints - identify best by validation later
         # NOTE: save_only_model=False required for DeepSpeed resume on spot pods
-        # Checkpoints are larger but can actually resume training
+        # Checkpoints are larger but
         'save_only_model': False,
-        'beta': CONFIG['beta'],
-        'bf16': True,
-        'optim': 'adamw_bnb_8bit',  # 8-bit Adam - half optimizer memory
-        'gradient_checkpointing': True,
-        'gradient_checkpointing_kwargs': {'use_reentrant': False},  # Fix for shape mismatch
-        'remove_unused_columns': False,  # Keep 'answer' column for reward fn
-        'report_to': 'none',  # Disable wandb unless you want it
     }
     
-    # Add vLLM config if enabled
-    if args.use_vllm:
-        print("    vLLM: ENABLED (server mode)")
-        print(f"    TRL version: {trl.__version__}")
-        
-        # TRL API changed over versions - detect what's available
-        import inspect
-        grpo_params = inspect.signature(GRPOConfig).parameters
-        
-        grpo_kwargs['use_vllm'] = True
-        
-        # vllm_mode was added in TRL ~0.16+
-        if 'vllm_mode' in grpo_params:
-            grpo_kwargs['vllm_mode'] = 'server'
-            print("    Using vllm_mode='server'")
-        
-        # Server host/port config
-        if 'vllm_server_host' in grpo_params:
-            grpo_kwargs['vllm_server_host'] = args.vllm_host
-            grpo_kwargs['vllm_server_port'] = args.vllm_port
-        elif 'vllm_server_url' in grpo_params:
-            # Some versions use URL instead
-            grpo_kwargs['vllm_server_url'] = f"http://{args.vllm_host}:{args.vllm_port}"
-        
-        print(f"    Server: {args.vllm_host}:{args.vllm_port}")
-    else:
-        print("    vLLM: DISABLED (using transformers generation)")
+    grpo_config = GRPOConfig(**grpo_kwargs)
     
-    training_args = GRPOConfig(**grpo_kwargs)
-    
-    # Initialize trainer (this triggers DeepSpeed ZeRO-3 init)
-    print("\nInitializing GRPO trainer (DeepSpeed ZeRO-3 sharding)...")
-    init_start = time.time()
-    
-    trainer = GRPOTrainer(
+    # GRPO trainer
+    print("\nInitializing GRPO trainer...")
+    grpo_trainer = GRPOTrainer(
         model=args.model,
-        reward_funcs=reward_fn,
-        args=training_args,
+        tokenizer=tokenizer,
+        args=grpo_config,
         train_dataset=train_dataset,
-        processing_class=tokenizer,
+        reward_fn=reward_fn,
+        callbacks=[RewardThresholdSaveCallback(), CheckpointCleanupCallback(output_dir)],
+        resume_from_checkpoint=resume_from,
+        no_vllm=args.no_vllm,
     )
     
-    # Add reward-based checkpoint saving
-    trainer.add_callback(RewardThresholdSaveCallback(threshold=0.3))
-    
-    init_elapsed = time.time() - init_start
-    print(f"✓ Trainer initialized ({init_elapsed:.0f}s)")
-    
-    # NOW wait for vLLM (after DeepSpeed init, so both load in parallel)
-    if args.use_vllm:
-        wait_for_vllm(args.vllm_host, args.vllm_port)
-    
     # Train
-    print("\n" + "-" * 70)
-    print("Starting training...")
-    print("-" * 70)
+    print("\nStarting training...")
+    grpo_trainer.train()
     
-    trainer.train(resume_from_checkpoint=resume_from)
-    
-    # Keeping all checkpoints for analysis
-    # cleanup_checkpoints(output_dir)
-    
-    # Training complete - final checkpoint is already saved by trainer
-    print("\n" + "=" * 70)
-    print("Training complete!")
-    print("=" * 70)
-    
-    remaining = get_checkpoints(output_dir)
-    print(f"\nCheckpoints retained: {[c[1].name for c in remaining]}")
-    print(f"Use the latest checkpoint for evaluation.")
-
+    print("\nTraining complete!")
+    print(f"Final checkpoints in {output_dir}")
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, required=True,
-                        help='HuggingFace model name')
-    parser.add_argument('--use-vllm', action='store_true', default=True,
-                        help='Use vLLM for generation (default: True)')
-    parser.add_argument('--no-vllm', action='store_false', dest='use_vllm',
-                        help='Disable vLLM (use transformers generation)')
-    parser.add_argument('--vllm-host', type=str, default='localhost',
-                        help='vLLM server host')
-    parser.add_argument('--vllm-port', type=int, default=8000,
-                        help='vLLM server port')
+    parser.add_argument('--model', type=str, required=True, help='HuggingFace model name')
+    parser.add_argument('--no_vllm', action='store_true', help='Disable vLLM server mode')
     args = parser.parse_args()
     
     train(args)
-
 
 if __name__ == "__main__":
     main()

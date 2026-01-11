@@ -13,19 +13,38 @@ Validate RL training pipeline on simple 4-step arithmetic before applying to int
 
 
 ## Summary of checkpoing saving logic
+1. Staticly defined save every 20 steps
+1. Checkpoints saved if reward exceeds 0.3
+1. or represents a new best
+1. older ones are pruned
+1. After every save event, only the first, secont to last, and most recent valid checkpoints are saved.
+1. Checkpoints are of the form that training could be restarted from the checkpoint (there are other versions that's don't save enough information for this)
 
+## Summary of reporting
+1. Configuration enagles logging steps at various frequencies. currently set to 1
+1. Reward based saving prints report to screen if save performed because of reward increase
+1. CheckpiontLeanupCallback reports to screen details about what's being removed
+
+
+## Things to verify
+1. Full model input and output saved for each step in training
+1. Validation set should be checked against problems seen in training before doing evaluation
+1. Prompt enforces no COT and, when necessary, defines precision. (this shouldn't be necessary with integer x integer)
 
 # GRPO Reinforcement Learning Pipeline Workflow (Non-CoT Focus)
 
 ## Todo 
+1. How much of this can have validation and test code written 
+1. modiy evaluate.py and train.py to share a common answer extraction and preprocessing library. refactor to new utils module.
 1. Generate problems dynamically in a way that will survive transition from positive control to interleave
   1. how is validation hanled in this situation?
 1. Verify that all prompts sent to and responses received from the models are saved as part of the output
   1. Without doing this we won't have any data to troubleshoot if training doesn't happen.
   1. What are the storage implications of this. surely we can be doing compression on the fly.
 1. generate oversized validation set to ensure sufficient size after removing previously observed problems
-1. Verify and possibly enhance current logging level. 
-1. Generate oversized validation dataset.
+1. Add timestamp and global setp numbers information to logging
+1. script to generate oversized validation dataset.
+1. Verify checkpoints are the right kind of checkpoints to resume training if
 
 ## Stuff currently being worked on
 1. determine how large training data set should be  (currently 2.5k?)
