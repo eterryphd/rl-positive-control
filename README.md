@@ -23,7 +23,9 @@ Validate RL training pipeline on simple 4-step arithmetic before applying to int
 1. Verify that all prompts sent to and responses received from the models are saved as part of the output
   1. Without doing this we won't have any data to troubleshoot if training doesn't happen.
   1. What are the storage implications of this. surely we can be doing compression on the fly.
+1. generate oversized validation set to ensure sufficient size after removing previously observed problems
 1. Verify and possibly enhance current logging level. 
+1. Generate oversized validation dataset.
 
 ## Stuff currently being worked on
 1. determine how large training data set should be  (currently 2.5k?)
