@@ -25,7 +25,7 @@ export NCCL_IB_RETRY_COUNT=20
 sync_cache() {
     if [ -d "$NETWORK_CACHE_DIR" ]; then
         echo ">>> Syncing cache from network volume..."
-        rsync -a --delete "$NETWORK_CACHE_DIR/" "$LOCAL_CACHE_DIR/"
+        cp -r "$NETWORK_CACHE_DIR/"* "$LOCAL_CACHE_DIR/"  # Use cp if rsync unavailable
     else
         echo ">>> No network cache found, using fresh local cache"
     fi
@@ -44,7 +44,7 @@ validate_cache() {
 # Function to sync back to network (on exit)
 sync_back() {
     echo ">>> Syncing cache back to network volume..."
-    rsync -a --delete "$LOCAL_CACHE_DIR/" "$NETWORK_CACHE_DIR/"
+    cp -r "$LOCAL_CACHE_DIR/"* "$NETWORK_CACHE_DIR/"  # Use cp if rsync unavailable
 }
 
 # Trap for cleanup
