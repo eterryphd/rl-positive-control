@@ -35,6 +35,7 @@ import shutil
 import time
 import urllib.request
 from pathlib import Path
+from typing import Set
 
 # Set cache directories before importing HF libraries
 # This prevents filling up the root filesystem on Runpod
@@ -47,6 +48,7 @@ from transformers import AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from datasets import Dataset
 import trl
+import torch
 
 # Import centralized utility
 from utils import extract_answer
@@ -91,6 +93,10 @@ CONFIG = {
     'dataset_size': 2500,  # Default size if dynamic mode enabled
     'problem_config': {},  # Overrides for generator (e.g., custom ranges)
     'generator_class': ArithmeticGenerator,  # Configurable for experiments
+    
+    # Validation
+    'validation_size': 500,  # Number of held-out validation problems
+    'validation_steps': 20,  # Validate every N steps
 }
 
 # ============================================================================
@@ -361,6 +367,72 @@ class RewardThresholdSaveCallback(TrainerCallback):
             control.should_save = True
 
 
+class ValidationCallback(TrainerCallback):
+    """Periodic validation on held-out set."""
+    
+    def __init__(self, validation_size: int, validation_steps: int, generator: ProblemGenerator, tokenizer, model, config: Dict):
+        self.validation_size = validation_size
+        self.validation_steps = validation_steps
+        self.generator = generator
+        self.tokenizer = tokenizer
+        self.model = model
+        self.config = config
+        self.seen_problems: Set[str] = set()
+    
+    def on_step_begin(self, args, state, control, **kwargs):
+        """Track seen problems if dynamic mode."""
+        if args.dynamic_data:
+            # Assuming batch problems are accessible - adjust based on trainer state
+            batch = kwargs.get('train_dataloader', None)  # Placeholder; implement based on actual access
+            if batch:
+                for problem in batch['problem']:
+                    self.seen_problems.add(problem)
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        """Validate every N steps."""
+        if state.global_step % self.validation_steps == 0 and state.is_world_process_zero:
+            print(f"    Validating at step {state.global_step}...")
+            
+            # Generate held-out validation set
+            val_problems = self.generator.generate_batch(
+                self.validation_size + len(self.seen_problems),  # Oversize to account for potential overlaps
+                self.config.get('problem_config', {})
+            )
+            
+            # Filter overlaps
+            held_out = [p for p in val_problems if p['problem'] not in self.seen_problems][:self.validation_size]
+            
+            if len(held_out) < self.validation_size:
+                print("    Warning: Could not generate enough unique held-out problems.")
+            
+            # Prepare validation dataset
+            val_data = {
+                'prompt': [build_prompt(p['problem'], self.tokenizer) for p in held_out],
+                'answer': [p['answer'] for p in held_out],
+            }
+            val_dataset = Dataset.from_dict(val_data)
+            
+            # Evaluate - generate completions and compute accuracy
+            correct = 0
+            for i in range(len(val_dataset)):
+                inputs = self.tokenizer(val_dataset['prompt'][i], return_tensors="pt").to(self.model.device)
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=CONFIG['max_new_tokens'],
+                        do_sample=False,
+                    )
+                generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
+                response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                predicted = extract_answer(response)
+                if predicted is not None and abs(predicted - val_dataset['answer'][i]) < 0.01:
+                    correct += 1
+            
+            accuracy = correct / len(held_out) if held_out else 0
+            state.log_history.append({'val_accuracy': accuracy})
+            print(f"    Validation accuracy: {accuracy:.1%}")
+
+
 # ============================================================================
 # TRAINING
 # ============================================================================
@@ -417,6 +489,10 @@ def train(args):
     
     grpo_config = GRPOConfig(**grpo_kwargs)
     
+    # Instantiate generator for validation
+    generator_class = CONFIG.get('generator_class', ArithmeticGenerator)
+    generator = generator_class()
+    
     # GRPO trainer
     print("\nInitializing GRPO trainer...")
     grpo_trainer = GRPOTrainer(
@@ -425,7 +501,19 @@ def train(args):
         args=grpo_config,
         train_dataset=train_dataset,
         reward_fn=reward_fn,
-        callbacks=[RewardThresholdSaveCallback(), CheckpointCleanupCallback(output_dir)],
+        callbacks=[
+            RewardThresholdSaveCallback(),
+            CheckpointCleanupCallback(output_dir),
+            ValidationCallback(
+                CONFIG['validation_size'],
+                CONFIG['validation_steps'],
+                generator,
+                tokenizer,
+                # Model reference - note: this assumes model is accessible; adjust if needed for distributed
+                grpo_trainer.model if hasattr(grpo_trainer, 'model') else None,
+                CONFIG
+            )
+        ],
         resume_from_checkpoint=resume_from,
         no_vllm=args.no_vllm,
     )

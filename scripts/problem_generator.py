@@ -8,7 +8,7 @@ for arithmetic (multiplication) problems.
 
 import json
 import random
-from typing import Dict, List
+from typing import Dict, List, Set
 from pathlib import Path
 from generators.base import ProblemGenerator
 
@@ -97,6 +97,19 @@ class ArithmeticGenerator(ProblemGenerator):
             p = self.generate_problem(config)
             if p['problem'] not in seen:
                 seen.add(p['problem'])
+                problems.append(p)
+        
+        return problems
+    
+    def generate_held_out(self, n: int, seen: Set[str], config: Dict = None) -> List[Dict]:
+        """Generate n unique problems not in the seen set."""
+        if config is None:
+            config = DEFAULT_CONFIG
+        
+        problems = []
+        while len(problems) < n:
+            p = self.generate_problem(config)
+            if p['problem'] not in seen:
                 problems.append(p)
         
         return problems
