@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+# scripts/train.py
 """
-RL training for arithmetic task using GRPO.
+RL training - arithmetic task using GRPO.
 
 This is a positive control to validate the RL pipeline before
 applying to more complex tasks like interleaving.
@@ -51,6 +51,10 @@ import trl
 # Import centralized utility
 from utils import extract_answer
 
+# Import generator for dynamic data
+from generators.base import ProblemGenerator
+from problem_generator import ArithmeticGenerator
+
 # ============================================================================
 # CONFIG - User configurable settings
 # ============================================================================
@@ -82,6 +86,11 @@ CONFIG = {
     # Paths
     'data_dir': 'data',
     'output_dir': '/workspace/checkpoints',
+    
+    # Dynamic data generation
+    'dataset_size': 2500,  # Default size if dynamic mode enabled
+    'problem_config': {},  # Overrides for generator (e.g., custom ranges)
+    'generator_class': ArithmeticGenerator,  # Configurable for experiments
 }
 
 # ============================================================================
@@ -189,22 +198,43 @@ def build_prompt(problem: str, tokenizer) -> str:
         add_generation_prompt=True
     )
 
-
-def load_dataset_for_grpo(tokenizer) -> Dataset:
-    """Load and format dataset for GRPO trainer."""
-    data_path = Path(CONFIG['data_dir']) / 'train.json'
+def prepare_dataset(tokenizer, args, config: Dict) -> Dataset:
+    """Prepare dataset - static or dynamic based on flag."""
+    if args.dynamic_data:
+        print(">>> Dynamic data mode enabled - generating fresh dataset")
+        
+        # Instantiate generator from config
+        generator_class = config.get('generator_class', ArithmeticGenerator)
+        generator: ProblemGenerator = generator_class()
+        
+        # Generate fresh problems
+        problems = generator.generate_batch(
+            config['dataset_size'],
+            config.get('problem_config', {})
+        )
+        
+        data = {
+            'prompt': [build_prompt(p['problem'], tokenizer) for p in problems],
+            'problem': [p['problem'] for p in problems],
+            'answer': [p['answer'] for p in problems],
+        }
+        
+        return Dataset.from_dict(data)
     
-    with open(data_path) as f:
-        problems = json.load(f)
-    
-    # GRPO expects 'prompt' column
-    data = {
-        'prompt': [build_prompt(p['problem'], tokenizer) for p in problems],
-        'problem': [p['problem'] for p in problems],
-        'answer': [p['answer'] for p in problems],
-    }
-    
-    return Dataset.from_dict(data)
+    else:
+        print(">>> Static data mode - loading from file")
+        data_path = Path(CONFIG['data_dir']) / 'train.json'
+        
+        with open(data_path) as f:
+            problems = json.load(f)
+        
+        data = {
+            'prompt': [build_prompt(p['problem'], tokenizer) for p in problems],
+            'problem': [p['problem'] for p in problems],
+            'answer': [p['answer'] for p in problems],
+        }
+        
+        return Dataset.from_dict(data)
 
 
 # ============================================================================
@@ -347,9 +377,9 @@ def train(args):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"  # Required for GRPO
     
-    # Load dataset
-    print("Loading dataset...")
-    train_dataset = load_dataset_for_grpo(tokenizer)
+    # Prepare dataset
+    print("Preparing dataset...")
+    train_dataset = prepare_dataset(tokenizer, args, CONFIG)
     print(f"    Train: {len(train_dataset)} examples")
     
     # Create output directory
@@ -411,6 +441,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, required=True, help='HuggingFace model name')
     parser.add_argument('--no_vllm', action='store_true', help='Disable vLLM server mode')
+    parser.add_argument('--dynamic_data', action='store_true', help='Enable dynamic data generation')
     args = parser.parse_args()
     
     train(args)
