@@ -1,4 +1,4 @@
-# scripts/train.py
+#!/usr/bin/env python3
 """
 RL training - arithmetic task using GRPO.
 
@@ -50,8 +50,8 @@ from datasets import Dataset
 import trl
 import torch
 
-# Import centralized utility
-from utils import extract_answer
+# Import centralized utilities
+from utils import extract_answer, build_prompt, SYSTEM_MESSAGE
 
 # Import generator for dynamic data
 from generators.base import ProblemGenerator
@@ -62,8 +62,7 @@ from problem_generator import ArithmeticGenerator
 # ============================================================================
 
 CONFIG = {
-    # Prompt configuration - MUST MATCH evaluate.py
-    'system_message': "You are a calculator. Output only the number.",
+    # Prompt configuration - system message centralized in utils.py
     'max_new_tokens': 4096,  # Interleaved output needs ~1000 tokens + buffer
     'max_prompt_length': 2048,  # Full texts + instructions ~1200 tokens
     
@@ -191,18 +190,6 @@ def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
 # ============================================================================
 # DATA LOADING
 # ============================================================================
-
-def build_prompt(problem: str, tokenizer) -> str:
-    """Build chat-formatted prompt."""
-    messages = [
-        {"role": "system", "content": CONFIG['system_message']},
-        {"role": "user", "content": problem}
-    ]
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
 
 def prepare_dataset(tokenizer, args, config: Dict) -> Dataset:
     """Prepare dataset - static or dynamic based on flag."""
@@ -394,21 +381,16 @@ class ValidationCallback(TrainerCallback):
             print(f"    Validating at step {state.global_step}...")
             
             # Generate held-out validation set
-            val_problems = self.generator.generate_batch(
-                self.validation_size + len(self.seen_problems),  # Oversize to account for potential overlaps
+            val_problems = self.generator.generate_held_out(
+                self.validation_size,
+                self.seen_problems,
                 self.config.get('problem_config', {})
             )
             
-            # Filter overlaps
-            held_out = [p for p in val_problems if p['problem'] not in self.seen_problems][:self.validation_size]
-            
-            if len(held_out) < self.validation_size:
-                print("    Warning: Could not generate enough unique held-out problems.")
-            
             # Prepare validation dataset
             val_data = {
-                'prompt': [build_prompt(p['problem'], self.tokenizer) for p in held_out],
-                'answer': [p['answer'] for p in held_out],
+                'prompt': [build_prompt(p['problem'], self.tokenizer) for p in val_problems],
+                'answer': [p['answer'] for p in val_problems],
             }
             val_dataset = Dataset.from_dict(val_data)
             
@@ -428,7 +410,7 @@ class ValidationCallback(TrainerCallback):
                 if predicted is not None and abs(predicted - val_dataset['answer'][i]) < 0.01:
                     correct += 1
             
-            accuracy = correct / len(held_out) if held_out else 0
+            accuracy = correct / len(val_problems) if val_problems else 0
             state.log_history.append({'val_accuracy': accuracy})
             print(f"    Validation accuracy: {accuracy:.1%}")
 

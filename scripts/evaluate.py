@@ -32,15 +32,14 @@ from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
-# Import centralized utility
-from utils import extract_answer
+# Import centralized utilities (including system message and build_prompt)
+from utils import extract_answer, build_prompt, SYSTEM_MESSAGE
 
 # ============================================================================
 # CONFIG - User configurable settings
 # ============================================================================
 CONFIG = {
-    # Prompt configuration
-    'system_message': "You are a calculator. Output only the number.",
+    # Prompt configuration - system message centralized in utils.py
     'max_new_tokens': 150,
     
     # Paths
@@ -53,30 +52,14 @@ CONFIG = {
 
 
 # Expose for imports
-SYSTEM_MESSAGE = CONFIG['system_message']
 MAX_NEW_TOKENS = CONFIG['max_new_tokens']
-
-
-def build_prompt(problem: str, tokenizer) -> tuple[str, int]:
-    """
-    Build chat-formatted prompt and return (prompt_string, input_token_count).
-    """
-    messages = [
-        {"role": "system", "content": SYSTEM_MESSAGE},
-        {"role": "user", "content": problem}
-    ]
-    prompt = tokenizer.apply_chat_template(
-        messages, 
-        tokenize=False, 
-        add_generation_prompt=True
-    )
-    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
-    return prompt, input_ids.shape[1]
 
 
 def evaluate_single(model, tokenizer, problem: dict, device: str) -> dict:
     """Evaluate model on single problem."""
-    prompt, input_length = build_prompt(problem['problem'], tokenizer)
+    prompt = build_prompt(problem['problem'], tokenizer)
+    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
+    input_length = input_ids.shape[1]
     
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     
@@ -217,7 +200,7 @@ def main():
     
     # Build output with metadata
     # Generate example prompt for reproducibility
-    example_prompt, _ = build_prompt("35 + 17 - 8", tokenizer)
+    example_prompt = build_prompt("35 + 17 - 8", tokenizer)
     
     output = {
         'metadata': {
