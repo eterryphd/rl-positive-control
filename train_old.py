@@ -1,37 +1,44 @@
 #!/usr/bin/env python3
 """
-RL training - task-agnostic GRPO pipeline with full logging.
+RL training for arithmetic task using GRPO.
 
-Features:
-- Dynamic problem generation (fresh problem each step)
-- Complete audit trail of all prompts/completions/rewards
-- Held-out validation against full training history
-- Task-agnostic via pluggable generators
+This is a positive control to validate the RL pipeline before
+applying to more complex tasks like interleaving.
 
 TESTED STACK (HuggingFace Cookbook, Dec 2025):
     trl==0.23.1, vllm==0.11.0, transformers==4.57.0
+
+OPTIMIZATIONS:
+    - Waits for vLLM AFTER DeepSpeed init (parallel model loading)
+    - Saves 6-8 minutes of startup time
 
 Usage (with vLLM server mode - recommended for 4x A40):
     # Terminal 1: Start vLLM server on GPU 3
     CUDA_VISIBLE_DEVICES=3 trl vllm-serve --model meta-llama/Llama-3.1-8B-Instruct
     
     # Terminal 2: Launch training on GPUs 0,1,2
-    CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch \\
-        --config_file accelerate_config.yaml \\
-        --num_processes 3 \\
-        train.py --model meta-llama/Llama-3.1-8B-Instruct --dynamic-data
+    CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch \
+        --config_file accelerate_config.yaml \
+        --num_processes 3 \
+        train.py --model meta-llama/Llama-3.1-8B-Instruct
+
+Usage (without vLLM - slower but simpler):
+    accelerate launch --config_file accelerate_config.yaml train.py \
+        --model meta-llama/Llama-3.1-8B-Instruct --no-vllm
 """
 
 import argparse
 import json
+import math
 import os
+import re
 import shutil
 import time
 import urllib.request
 from pathlib import Path
-from typing import Set, Optional
 
 # Set cache directories before importing HF libraries
+# This prevents filling up the root filesystem on Runpod
 if 'HF_HOME' not in os.environ:
     os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
 if 'PIP_CACHE_DIR' not in os.environ:
@@ -40,68 +47,64 @@ if 'PIP_CACHE_DIR' not in os.environ:
 from transformers import AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from datasets import Dataset
-from accelerate import PartialState
-import torch
-
-# Import utilities
-from utils import build_prompt
-
-# Import generator infrastructure
-from generators.base import ProblemGenerator
-from problem_generator import ArithmeticGenerator
-
-# Import tracking and dynamic dataset
-from training_tracker import TrainingTracker, load_seen_problems
-from dynamic_dataset import SizedDynamicDataset
+import trl
 
 # ============================================================================
-# CONFIG
+# CONFIG - User configurable settings
 # ============================================================================
 
 CONFIG = {
-    # Token limits - sized for interleave task to validate full pipeline
-    'max_new_tokens': 4096,
-    'max_prompt_length': 2048,
+    # Prompt configuration - MUST MATCH evaluate.py
+    'system_message': "You are a calculator. Output only the number.",
+    'max_new_tokens': 4096,  # Interleaved output needs ~1000 tokens + buffer
+    'max_prompt_length': 2048,  # Full texts + instructions ~1200 tokens
     
     # Generation
-    'temperature': 0.9,
-    'num_generations': 6,
+    'temperature': 0.9,  # More diversity for reward variance
+    'num_generations': 6,  # More samples for GRPO signal
     
     # Training - tuned for 4x A40 (48GB each)
     'learning_rate': 1e-6,
     'num_train_epochs': 1,
     'per_device_train_batch_size': 1,
     'gradient_accumulation_steps': 8,
-    'max_steps': 200,
-    'logging_steps': 1,
-    'save_steps': 20,
+    'max_steps': 100,
+    'logging_steps': 10,
+    # NOTE: save_steps=10 for spot instance safety (~10-12 min between saves)
+    # Increase to 25-50 for on-demand instances to reduce I/O overhead
+    'save_steps': 10,
     
     # GRPO specific
-    'beta': 0.0,
+    'beta': 0.0,  # KL penalty - 0.0 is now standard (no ref model needed)
     
     # Paths
     'data_dir': 'data',
     'output_dir': '/workspace/checkpoints',
-    'log_dir': '/workspace/training_logs',
-    
-    # Dynamic data generation
-    'dataset_size': 10000,  # Nominal size (actual is infinite)
-    'problem_config': {},
-    
-    # Task selection
-    'generator_class': ArithmeticGenerator,
-    
-    # Validation
-    'validation_size': 500,
-    'validation_steps': 20,
 }
 
 # ============================================================================
-# VLLM SERVER WAIT
+# VLLM SERVER WAIT (for parallel loading optimization)
 # ============================================================================
 
-def wait_for_vllm(host: str = 'localhost', port: int = 8000, timeout: int = 1800, check_interval: int = 5):
-    """Wait for vLLM server to be ready."""
+def wait_for_vllm(host: str, port: int, timeout: int = 1800, check_interval: int = 5):
+    """
+    Wait for vLLM server to be ready.
+    
+    Called AFTER DeepSpeed init to allow parallel model loading.
+    This saves 6-8 minutes compared to waiting before training starts.
+    
+    Args:
+        host: vLLM server host
+        port: vLLM server port
+        timeout: Maximum seconds to wait (default 30 min to handle slow compiles)
+        check_interval: Seconds between health checks
+    
+    Returns:
+        True if server is ready
+        
+    Raises:
+        RuntimeError if server not ready within timeout
+    """
     url = f"http://{host}:{port}/health"
     start = time.time()
     last_print = 0
@@ -116,6 +119,7 @@ def wait_for_vllm(host: str = 'localhost', port: int = 8000, timeout: int = 1800
             return True
         except (urllib.error.URLError, urllib.error.HTTPError, OSError):
             elapsed = time.time() - start
+            # Print progress every 30 seconds
             if elapsed - last_print >= 30:
                 print(f"    Still waiting for vLLM... ({elapsed:.0f}s)")
                 last_print = elapsed
@@ -125,112 +129,91 @@ def wait_for_vllm(host: str = 'localhost', port: int = 8000, timeout: int = 1800
 
 
 # ============================================================================
-# REWARD FUNCTION FACTORY (with logging)
+# REWARD FUNCTION
 # ============================================================================
 
-def make_reward_fn(generator: ProblemGenerator, tracker: TrainingTracker):
+def extract_answer(response: str):
+    """Extract numeric answer from model response."""
+    numbers = re.findall(r'-?\d+\.?\d*', response)
+    if numbers:
+        try:
+            return float(numbers[0])
+        except ValueError:
+            return None
+    return None
+
+
+def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
     """
-    Create reward function that logs everything to tracker.
+    Compute rewards for completions using continuous relative error.
     
-    The reward_fn is the interception point where we see:
-    - prompts (from dataset)
-    - completions (from model)
-    - answers (from dataset via kwargs)
-    - problems (from dataset via kwargs)
+    Reward based on how close the answer is - exponential decay.
+    Perfect = +1.0, order of magnitude off ≈ -0.3, way off → -1.0
     
-    We log all of this plus computed predictions and rewards.
+    Args:
+        prompts: List of prompt strings
+        completions: List of completion strings (model outputs)
+        **kwargs: May contain 'answer' from dataset
+    
+    Returns:
+        List of reward floats in [-1, 1]
     """
-    # Track step number (updated by callback)
-    step_counter = {'step': 0}
+    rewards = []
+    answers = kwargs.get('answer', [None] * len(prompts))
     
-    def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
-        """
-        Compute rewards and log all training examples.
-        """
-        rewards = []
-        answers = kwargs.get('answer', [None] * len(prompts))
-        problems = kwargs.get('problem', [''] * len(prompts))
+    for completion, answer in zip(completions, answers):
+        predicted = extract_answer(completion)
         
-        predictions = []
+        if predicted is None or answer is None:
+            rewards.append(-1.0)
+            continue
         
-        for completion, answer in zip(completions, answers):
-            predicted = generator.extract_answer(completion)
-            predictions.append(predicted)
-            
-            if predicted is None:
-                print(f"    Warning: Could not extract answer from: '{completion[:100]}'")
-            
-            reward = generator.compute_reward(predicted, answer)
-            rewards.append(reward)
+        # Relative error (add 1 to denominator to handle answer=0)
+        relative_error = abs(predicted - answer) / (abs(answer) + 1)
         
-        # Log everything to tracker
-        tracker.log_examples(
-            problems=problems,
-            prompts=prompts,
-            completions=completions,
-            answers=answers,
-            predictions=predictions,
-            rewards=rewards,
-            global_step=step_counter['step'],
-        )
+        # Exponential decay: perfect=1.0, 10% off≈0.6, 50% off≈0.08
+        raw_reward = math.exp(-relative_error * 5)
         
-        return rewards
+        # Scale to [-1, 1]
+        reward = 2 * raw_reward - 1
+        
+        rewards.append(reward)
     
-    # Expose step counter for callback to update
-    reward_fn.step_counter = step_counter
-    
-    return reward_fn
+    return rewards
 
 
 # ============================================================================
 # DATA LOADING
 # ============================================================================
 
-def prepare_dataset(tokenizer, args, config: dict, generator: ProblemGenerator, state: PartialState) -> Dataset:
-    """Prepare dataset - static file or dynamic generation."""
+def build_prompt(problem: str, tokenizer) -> str:
+    """Build chat-formatted prompt."""
+    messages = [
+        {"role": "system", "content": CONFIG['system_message']},
+        {"role": "user", "content": problem}
+    ]
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+
+def load_dataset_for_grpo(tokenizer) -> Dataset:
+    """Load and format dataset for GRPO trainer."""
+    data_path = Path(CONFIG['data_dir']) / 'train.json'
     
-    is_main = state.is_main_process
-    system_message = generator.system_message
+    with open(data_path) as f:
+        problems = json.load(f)
     
-    if args.dynamic_data:
-        if is_main:
-            print(f">>> Dynamic data mode - fresh problems each step")
-            print(f"    Task: {generator.task_name}")
-            print(f"    Nominal dataset size: {config['dataset_size']}")
-        
-        # Create dynamic dataset with rank-specific seed
-        dataset = SizedDynamicDataset(
-            generator=generator,
-            tokenizer=tokenizer,
-            config=config.get('problem_config', {}),
-            seed=42,
-            rank=state.process_index,
-            world_size=state.num_processes,
-            nominal_size=config['dataset_size'],
-        )
-        
-        return dataset
+    # GRPO expects 'prompt' column
+    data = {
+        'prompt': [build_prompt(p['problem'], tokenizer) for p in problems],
+        'problem': [p['problem'] for p in problems],
+        'answer': [p['answer'] for p in problems],
+    }
     
-    else:
-        if is_main:
-            print(">>> Static data mode - loading from file")
-        data_path = Path(config['data_dir']) / 'train.json'
-        
-        if not data_path.exists():
-            raise FileNotFoundError(f"Training data not found at {data_path}")
-        
-        with open(data_path) as f:
-            problems = json.load(f)
-        
-        data = {
-            'prompt': [build_prompt(p['problem'], tokenizer, system_message) for p in problems],
-            'problem': [p['problem'] for p in problems],
-            'answer': [p['answer'] for p in problems],
-        }
-        
-        if is_main:
-            print(f"    Loaded {len(problems)} problems from {data_path}")
-        return Dataset.from_dict(data)
+    return Dataset.from_dict(data)
 
 
 # ============================================================================
@@ -253,9 +236,10 @@ def get_checkpoints(output_dir: Path) -> list:
 
 
 def cleanup_checkpoints(output_dir: Path):
-    """Keep only: first, second-to-last, and last valid checkpoint."""
+    """Keep only: first, second-to-last, and last valid checkpoint. Remove invalid ones."""
     checkpoints = get_checkpoints(output_dir)
     
+    # First, remove any invalid checkpoints
     valid_checkpoints = []
     for step, path in checkpoints:
         if validate_checkpoint(path):
@@ -277,28 +261,33 @@ def cleanup_checkpoints(output_dir: Path):
 
 def validate_checkpoint(checkpoint_path: Path) -> bool:
     """Check if checkpoint has all required files for resumption."""
-    required_files = ['trainer_state.json']
+    required_files = [
+        'trainer_state.json',  # Training state
+    ]
     
     for f in required_files:
         if not (checkpoint_path / f).exists():
             return False
     
+    # Check for at least one model/optimizer shard
     has_model_files = any(
         checkpoint_path.glob('*.safetensors')
     ) or any(
         checkpoint_path.glob('*.bin')
     ) or (checkpoint_path / 'pytorch_model.bin').exists()
     
+    # For DeepSpeed, check for ZeRO checkpoint
     has_deepspeed = (checkpoint_path / 'zero_to_fp32.py').exists() or \
                     any(checkpoint_path.glob('global_step*'))
     
     return has_model_files or has_deepspeed
 
 
-def find_latest_checkpoint(output_dir: Path) -> Optional[str]:
+def find_latest_checkpoint(output_dir: Path) -> str | None:
     """Find latest valid checkpoint for resumption."""
     checkpoints = get_checkpoints(output_dir)
     
+    # Try checkpoints from newest to oldest
     for step, path in reversed(checkpoints):
         if validate_checkpoint(path):
             return str(path)
@@ -308,157 +297,17 @@ def find_latest_checkpoint(output_dir: Path) -> Optional[str]:
     return None
 
 
-# ============================================================================
-# CALLBACKS
-# ============================================================================
-
 class CheckpointCleanupCallback(TrainerCallback):
-    """Clean up old checkpoints after each save."""
+    """Clean up old checkpoints after each save. Only runs on main process."""
     
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
     
     def on_save(self, args, state, control, **kwargs):
+        """Called after checkpoint is saved."""
+        # Only run cleanup on main process to avoid race conditions
         if state.is_world_process_zero:
             cleanup_checkpoints(self.output_dir)
-
-
-class RewardThresholdSaveCallback(TrainerCallback):
-    """Save checkpoints when reward exceeds threshold or is new best."""
-    
-    def __init__(self, threshold: float = 0.3):
-        self.threshold = threshold
-        self.best_reward = float('-inf')
-    
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs is None:
-            return
-        
-        reward = logs.get('reward', None)
-        if reward is None:
-            return
-        
-        if reward > self.threshold or reward > self.best_reward:
-            if reward > self.best_reward:
-                self.best_reward = reward
-                print(f">>> New best reward: {reward:.3f} - saving checkpoint")
-            else:
-                print(f">>> Reward {reward:.3f} > {self.threshold} threshold - saving checkpoint")
-            control.should_save = True
-
-
-class StepCounterCallback(TrainerCallback):
-    """Update step counter for reward function logging."""
-    
-    def __init__(self, reward_fn):
-        self.reward_fn = reward_fn
-    
-    def on_step_begin(self, args, state, control, **kwargs):
-        self.reward_fn.step_counter['step'] = state.global_step
-
-
-class TrackerCallback(TrainerCallback):
-    """Manage tracker lifecycle (open/close log files)."""
-    
-    def __init__(self, tracker: TrainingTracker):
-        self.tracker = tracker
-    
-    def on_train_begin(self, args, state, control, **kwargs):
-        self.tracker.open()
-        
-        # Load any previously seen problems (for resume)
-        log_dir = Path(self.tracker.output_dir)
-        if log_dir.exists() and any(log_dir.glob('training_log_*.jsonl.gz')):
-            prev_seen = load_seen_problems(log_dir)
-            self.tracker.seen_problems.update(prev_seen)
-            if state.is_world_process_zero:
-                print(f">>> Loaded {len(prev_seen)} previously seen problems")
-    
-    def on_train_end(self, args, state, control, **kwargs):
-        self.tracker.close()
-        
-        if state.is_world_process_zero:
-            stats = self.tracker.get_stats()
-            print(f">>> Training complete: {stats['total_examples']} examples logged, "
-                  f"{stats['unique_problems']} unique problems")
-
-
-class ValidationCallback(TrainerCallback):
-    """
-    Periodic validation on held-out set.
-    
-    Uses tracker.seen_problems to ensure validation examples
-    haven't been seen during training.
-    """
-    
-    def __init__(self, validation_size: int, validation_steps: int,
-                 generator: ProblemGenerator, tokenizer, config: dict,
-                 tracker: TrainingTracker):
-        self.validation_size = validation_size
-        self.validation_steps = validation_steps
-        self.generator = generator
-        self.tokenizer = tokenizer
-        self.config = config
-        self.tracker = tracker
-    
-    def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % self.validation_steps != 0:
-            return
-        if not state.is_world_process_zero:
-            return
-        
-        print(f"\n>>> Validation at step {state.global_step}...")
-        print(f"    Training has seen {len(self.tracker.seen_problems)} unique problems")
-        
-        # Generate held-out problems (not in training history)
-        val_problems = self.generator.generate_held_out(
-            self.validation_size,
-            self.tracker.seen_problems,
-            self.config.get('problem_config', {})
-        )
-        
-        if not val_problems:
-            print("    Warning: Could not generate validation problems")
-            return
-        
-        # Get model
-        trainer = kwargs.get('trainer', None)
-        if trainer is None or not hasattr(trainer, 'model'):
-            print("    Warning: Cannot access model for validation")
-            return
-        
-        model = trainer.model
-        device = model.device if hasattr(model, 'device') else 'cuda'
-        system_message = self.generator.system_message
-        
-        # Evaluate
-        correct = 0
-        for problem in val_problems:
-            try:
-                prompt = build_prompt(problem['problem'], self.tokenizer, system_message)
-                inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
-                
-                with torch.no_grad():
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=self.config['max_new_tokens'],
-                        do_sample=False,
-                        pad_token_id=self.tokenizer.eos_token_id,
-                    )
-                
-                generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
-                response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-                
-                predicted = self.generator.extract_answer(response)
-                if self.generator.check_correct(predicted, problem['answer']):
-                    correct += 1
-                    
-            except Exception as e:
-                print(f"    Error evaluating: {e}")
-                continue
-        
-        accuracy = correct / len(val_problems) if val_problems else 0
-        print(f"    Accuracy: {accuracy:.1%} ({correct}/{len(val_problems)})")
 
 
 # ============================================================================
@@ -466,125 +315,147 @@ class ValidationCallback(TrainerCallback):
 # ============================================================================
 
 def train(args):
-    # Get distributed state early
-    state = PartialState()
-    is_main = state.is_main_process
-    
-    if is_main:
-        print("=" * 70)
-        print("GRPO TRAINING - TASK-AGNOSTIC PIPELINE")
-        print("=" * 70)
-    
-    # Instantiate generator
-    generator_class = CONFIG['generator_class']
-    generator: ProblemGenerator = generator_class()
-    if is_main:
-        print(f"\nTask: {generator.task_name}")
-        print(f"System message: {generator.system_message}")
-    
-    # Create tracker (only main process writes)
-    log_dir = Path(CONFIG['log_dir'])
-    tracker = TrainingTracker(log_dir, is_main_process=is_main)
+    """Main training function."""
+    print("=" * 70)
+    print("GRPO TRAINING - ARITHMETIC POSITIVE CONTROL")
+    print("=" * 70)
     
     # Load tokenizer
-    if is_main:
-        print(f"\nLoading tokenizer: {args.model}")
+    print(f"\nLoading tokenizer: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
+    tokenizer.padding_side = "left"  # Required for GRPO
     
-    # Prepare dataset
-    if is_main:
-        print("\nPreparing dataset...")
-    train_dataset = prepare_dataset(tokenizer, args, CONFIG, generator, state)
-    if is_main:
-        if hasattr(train_dataset, '__len__'):
-            print(f"    Dataset size: {len(train_dataset)} (nominal for dynamic)")
-        else:
-            print(f"    Dataset: infinite (dynamic generation)")
+    # Load dataset
+    print("Loading dataset...")
+    train_dataset = load_dataset_for_grpo(tokenizer)
+    print(f"    Train: {len(train_dataset)} examples")
     
-    # Output directory
+    # Create output directory
     output_dir = Path(CONFIG['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Check for checkpoint to resume
+    # Check for existing checkpoint to resume from
     resume_from = find_latest_checkpoint(output_dir)
-    if resume_from and is_main:
-        print(f"\n>>> Found checkpoint: {resume_from}")
-        print("    Will resume training.")
+    if resume_from:
+        print(f"\n>>> Found existing checkpoint: {resume_from}")
+        print("    Will resume training from this checkpoint.")
     
-    # GRPO config
-    if is_main:
-        print("\nConfiguring GRPO...")
-    grpo_config = GRPOConfig(
-        output_dir=str(output_dir),
-        learning_rate=CONFIG['learning_rate'],
-        num_train_epochs=CONFIG['num_train_epochs'],
-        per_device_train_batch_size=CONFIG['per_device_train_batch_size'],
-        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_generations=CONFIG['num_generations'],
-        max_completion_length=CONFIG['max_new_tokens'],
-        max_prompt_length=CONFIG['max_prompt_length'],
-        temperature=CONFIG['temperature'],
-        max_steps=CONFIG['max_steps'],
-        logging_steps=CONFIG['logging_steps'],
-        save_steps=CONFIG['save_steps'],
-        lr_scheduler_type='constant',
-        save_only_model=False,
-    )
+    # GRPO config - with proper multi-GPU settings
+    print("\nConfiguring GRPO...")
     
-    # Create reward function with tracker
-    reward_fn = make_reward_fn(generator, tracker)
+    grpo_kwargs = {
+        'output_dir': str(output_dir),
+        'learning_rate': CONFIG['learning_rate'],
+        'num_train_epochs': CONFIG['num_train_epochs'],
+        'per_device_train_batch_size': CONFIG['per_device_train_batch_size'],
+        'gradient_accumulation_steps': CONFIG['gradient_accumulation_steps'],
+        'num_generations': CONFIG['num_generations'],
+        'max_completion_length': CONFIG['max_new_tokens'],
+        'max_prompt_length': CONFIG['max_prompt_length'],
+        'temperature': CONFIG['temperature'],  # Diversity for reward variance
+        'max_steps': CONFIG['max_steps'],
+        'logging_steps': CONFIG['logging_steps'],
+        'save_steps': CONFIG['save_steps'],
+        'save_total_limit': 3,  # Keep only last 2 checkpoints (~50GB each)
+        # NOTE: save_only_model=False required for DeepSpeed resume on spot pods
+        # Checkpoints are larger but can actually resume training
+        'save_only_model': False,
+        'beta': CONFIG['beta'],
+        'bf16': True,
+        'optim': 'adamw_bnb_8bit',  # 8-bit Adam - half optimizer memory
+        'gradient_checkpointing': True,
+        'gradient_checkpointing_kwargs': {'use_reentrant': False},  # Fix for shape mismatch
+        'remove_unused_columns': False,  # Keep 'answer' column for reward fn
+        'report_to': 'none',  # Disable wandb unless you want it
+    }
     
-    # GRPO trainer
-    if is_main:
-        print("\nInitializing GRPO trainer...")
-    grpo_trainer = GRPOTrainer(
+    # Add vLLM config if enabled
+    if args.use_vllm:
+        print("    vLLM: ENABLED (server mode)")
+        print(f"    TRL version: {trl.__version__}")
+        
+        # TRL API changed over versions - detect what's available
+        import inspect
+        grpo_params = inspect.signature(GRPOConfig).parameters
+        
+        grpo_kwargs['use_vllm'] = True
+        
+        # vllm_mode was added in TRL ~0.16+
+        if 'vllm_mode' in grpo_params:
+            grpo_kwargs['vllm_mode'] = 'server'
+            print("    Using vllm_mode='server'")
+        
+        # Server host/port config
+        if 'vllm_server_host' in grpo_params:
+            grpo_kwargs['vllm_server_host'] = args.vllm_host
+            grpo_kwargs['vllm_server_port'] = args.vllm_port
+        elif 'vllm_server_url' in grpo_params:
+            # Some versions use URL instead
+            grpo_kwargs['vllm_server_url'] = f"http://{args.vllm_host}:{args.vllm_port}"
+        
+        print(f"    Server: {args.vllm_host}:{args.vllm_port}")
+    else:
+        print("    vLLM: DISABLED (using transformers generation)")
+    
+    training_args = GRPOConfig(**grpo_kwargs)
+    
+    # Initialize trainer (this triggers DeepSpeed ZeRO-3 init)
+    print("\nInitializing GRPO trainer (DeepSpeed ZeRO-3 sharding)...")
+    init_start = time.time()
+    
+    trainer = GRPOTrainer(
         model=args.model,
-        processing_class=tokenizer,
-        args=grpo_config,
+        reward_funcs=reward_fn,
+        args=training_args,
         train_dataset=train_dataset,
-        reward_funcs=reward_fn,  # renamed from 'reward_fn' in TRL 0.23.x
-        callbacks=[
-            RewardThresholdSaveCallback(),
-            CheckpointCleanupCallback(output_dir),
-            StepCounterCallback(reward_fn),
-            TrackerCallback(tracker),
-            ValidationCallback(
-                CONFIG['validation_size'],
-                CONFIG['validation_steps'],
-                generator,
-                tokenizer,
-                CONFIG,
-                tracker
-            )
-        ],
+        processing_class=tokenizer,
     )
     
-    # Wait for vLLM if using it
-    if not args.no_vllm:
-        if is_main:
-            print("\n>>> Trainer initialized, waiting for vLLM server...")
-        wait_for_vllm(host='localhost', port=args.vllm_port)
+    # Add checkpoint cleanup callback
+    trainer.add_callback(CheckpointCleanupCallback(output_dir))
+    
+    init_elapsed = time.time() - init_start
+    print(f"✓ Trainer initialized ({init_elapsed:.0f}s)")
+    
+    # NOW wait for vLLM (after DeepSpeed init, so both load in parallel)
+    if args.use_vllm:
+        wait_for_vllm(args.vllm_host, args.vllm_port)
     
     # Train
-    if is_main:
-        print("\nStarting training...")
-    grpo_trainer.train(resume_from_checkpoint=resume_from)
+    print("\n" + "-" * 70)
+    print("Starting training...")
+    print("-" * 70)
     
-    if is_main:
-        print("\nTraining complete!")
-        print(f"Checkpoints: {output_dir}")
-        print(f"Training logs: {log_dir}")
+    trainer.train(resume_from_checkpoint=resume_from)
+    
+    # Clean up old checkpoints
+    print("\nCleaning up checkpoints...")
+    cleanup_checkpoints(output_dir)
+    
+    # Training complete - final checkpoint is already saved by trainer
+    print("\n" + "=" * 70)
+    print("Training complete!")
+    print("=" * 70)
+    
+    remaining = get_checkpoints(output_dir)
+    print(f"\nCheckpoints retained: {[c[1].name for c in remaining]}")
+    print(f"Use the latest checkpoint for evaluation.")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, required=True, help='HuggingFace model name')
-    parser.add_argument('--no-vllm', action='store_true', help='Disable vLLM server mode')
-    parser.add_argument('--vllm-port', type=int, default=8000, help='vLLM server port')
-    parser.add_argument('--dynamic-data', action='store_true', help='Generate problems dynamically')
+    parser.add_argument('--model', type=str, required=True,
+                        help='HuggingFace model name')
+    parser.add_argument('--use-vllm', action='store_true', default=True,
+                        help='Use vLLM for generation (default: True)')
+    parser.add_argument('--no-vllm', action='store_false', dest='use_vllm',
+                        help='Disable vLLM (use transformers generation)')
+    parser.add_argument('--vllm-host', type=str, default='localhost',
+                        help='vLLM server host')
+    parser.add_argument('--vllm-port', type=int, default=8000,
+                        help='vLLM server port')
     args = parser.parse_args()
     
     train(args)

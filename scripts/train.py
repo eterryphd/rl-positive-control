@@ -23,6 +23,7 @@ Usage (with vLLM server mode - recommended for 4x A40):
 """
 
 import argparse
+import inspect
 import json
 import os
 import shutil
@@ -517,22 +518,57 @@ def train(args):
     # GRPO config
     if is_main:
         print("\nConfiguring GRPO...")
-    grpo_config = GRPOConfig(
-        output_dir=str(output_dir),
-        learning_rate=CONFIG['learning_rate'],
-        num_train_epochs=CONFIG['num_train_epochs'],
-        per_device_train_batch_size=CONFIG['per_device_train_batch_size'],
-        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_generations=CONFIG['num_generations'],
-        max_completion_length=CONFIG['max_new_tokens'],
-        max_prompt_length=CONFIG['max_prompt_length'],
-        temperature=CONFIG['temperature'],
-        max_steps=CONFIG['max_steps'],
-        logging_steps=CONFIG['logging_steps'],
-        save_steps=CONFIG['save_steps'],
-        lr_scheduler_type='constant',
-        save_only_model=False,
-    )
+    
+    grpo_kwargs = {
+        'output_dir': str(output_dir),
+        'learning_rate': CONFIG['learning_rate'],
+        'num_train_epochs': CONFIG['num_train_epochs'],
+        'per_device_train_batch_size': CONFIG['per_device_train_batch_size'],
+        'gradient_accumulation_steps': CONFIG['gradient_accumulation_steps'],
+        'num_generations': CONFIG['num_generations'],
+        'max_completion_length': CONFIG['max_new_tokens'],
+        'max_prompt_length': CONFIG['max_prompt_length'],
+        'temperature': CONFIG['temperature'],
+        'max_steps': CONFIG['max_steps'],
+        'logging_steps': CONFIG['logging_steps'],
+        'save_steps': CONFIG['save_steps'],
+        'save_total_limit': 3,
+        'save_only_model': False,  # Required for DeepSpeed resume
+        'beta': CONFIG['beta'],
+        'bf16': True,
+        'optim': 'adamw_bnb_8bit',
+        'gradient_checkpointing': True,
+        'gradient_checkpointing_kwargs': {'use_reentrant': False},
+        'remove_unused_columns': False,  # Keep 'answer' and 'problem' for reward fn
+        'report_to': 'none',
+        'lr_scheduler_type': 'constant',
+    }
+    
+    # Add vLLM config if enabled
+    if not args.no_vllm:
+        if is_main:
+            print("    vLLM: ENABLED (server mode)")
+        
+        grpo_params = inspect.signature(GRPOConfig).parameters
+        
+        grpo_kwargs['use_vllm'] = True
+        
+        if 'vllm_mode' in grpo_params:
+            grpo_kwargs['vllm_mode'] = 'server'
+        
+        if 'vllm_server_host' in grpo_params:
+            grpo_kwargs['vllm_server_host'] = 'localhost'
+            grpo_kwargs['vllm_server_port'] = args.vllm_port
+        elif 'vllm_server_url' in grpo_params:
+            grpo_kwargs['vllm_server_url'] = f"http://localhost:{args.vllm_port}"
+        
+        if is_main:
+            print(f"    Server: localhost:{args.vllm_port}")
+    else:
+        if is_main:
+            print("    vLLM: DISABLED")
+    
+    grpo_config = GRPOConfig(**grpo_kwargs)
     
     # Create reward function with tracker
     reward_fn = make_reward_fn(generator, tracker)
@@ -545,22 +581,22 @@ def train(args):
         processing_class=tokenizer,
         args=grpo_config,
         train_dataset=train_dataset,
-        reward_funcs=reward_fn,  # renamed from 'reward_fn' in TRL 0.23.x
-        callbacks=[
-            RewardThresholdSaveCallback(),
-            CheckpointCleanupCallback(output_dir),
-            StepCounterCallback(reward_fn),
-            TrackerCallback(tracker),
-            ValidationCallback(
-                CONFIG['validation_size'],
-                CONFIG['validation_steps'],
-                generator,
-                tokenizer,
-                CONFIG,
-                tracker
-            )
-        ],
+        reward_funcs=reward_fn,
     )
+    
+    # Add callbacks after construction (like working version)
+    grpo_trainer.add_callback(RewardThresholdSaveCallback())
+    grpo_trainer.add_callback(CheckpointCleanupCallback(output_dir))
+    grpo_trainer.add_callback(StepCounterCallback(reward_fn))
+    grpo_trainer.add_callback(TrackerCallback(tracker))
+    grpo_trainer.add_callback(ValidationCallback(
+        CONFIG['validation_size'],
+        CONFIG['validation_steps'],
+        generator,
+        tokenizer,
+        CONFIG,
+        tracker
+    ))
     
     # Wait for vLLM if using it
     if not args.no_vllm:
