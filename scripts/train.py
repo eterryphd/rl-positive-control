@@ -53,7 +53,7 @@ from problem_generator import ArithmeticGenerator
 
 # Import tracking and dynamic dataset
 from training_tracker import TrainingTracker, load_seen_problems
-from dynamic_dataset import SizedDynamicDataset
+# dynamic_dataset import removed - using HuggingFace Dataset instead
 
 # ============================================================================
 # CONFIG
@@ -195,20 +195,26 @@ def prepare_dataset(tokenizer, args, config: dict, generator: ProblemGenerator, 
     
     if args.dynamic_data:
         if is_main:
-            print(f">>> Dynamic data mode - fresh problems each step")
+            print(f">>> Dynamic data mode - generating {config['dataset_size']} problems")
             print(f"    Task: {generator.task_name}")
-            print(f"    Nominal dataset size: {config['dataset_size']}")
         
-        # Create dynamic dataset with rank-specific seed
-        dataset = SizedDynamicDataset(
-            generator=generator,
-            tokenizer=tokenizer,
-            config=config.get('problem_config', {}),
-            seed=42,
-            rank=state.process_index,
-            world_size=state.num_processes,
-            nominal_size=config['dataset_size'],
+        # Generate problems into a HuggingFace Dataset
+        # This is simpler and more compatible than IterableDataset
+        problems = generator.generate_batch(
+            config['dataset_size'],
+            config.get('problem_config', {})
         )
+        
+        data = {
+            'prompt': [build_prompt(p['problem'], tokenizer, system_message) for p in problems],
+            'problem': [p['problem'] for p in problems],
+            'answer': [p['answer'] for p in problems],
+        }
+        
+        dataset = Dataset.from_dict(data)
+        
+        if is_main:
+            print(f"    Generated {len(dataset)} unique problems")
         
         return dataset
     
@@ -500,10 +506,7 @@ def train(args):
         print("\nPreparing dataset...")
     train_dataset = prepare_dataset(tokenizer, args, CONFIG, generator, state)
     if is_main:
-        if hasattr(train_dataset, '__len__'):
-            print(f"    Dataset size: {len(train_dataset)} (nominal for dynamic)")
-        else:
-            print(f"    Dataset: infinite (dynamic generation)")
+        print(f"    Dataset size: {len(train_dataset)} examples")
     
     # Output directory
     output_dir = Path(CONFIG['output_dir'])
