@@ -194,6 +194,8 @@ def load_seen_problems(log_dir: Path) -> Set[str]:
     Useful for resuming training and ensuring validation excludes
     all previously seen problems.
     
+    Robust to corrupt/incomplete gzip files from crashed runs.
+    
     Args:
         log_dir: Directory containing training_log_*.jsonl.gz files
     
@@ -204,14 +206,27 @@ def load_seen_problems(log_dir: Path) -> Set[str]:
     log_files = sorted(log_dir.glob('training_log_*.jsonl.gz'))
     
     for log_file in log_files:
-        print(f"    Loading seen problems from {log_file.name}...")
-        with gzip.open(log_file, 'rt', encoding='utf-8') as f:
-            for line in f:
-                record = json.loads(line)
-                if record.get('type') in ('header', 'footer'):
-                    continue
-                if 'problem' in record:
-                    seen.add(record['problem'])
+        try:
+            print(f"    Loading seen problems from {log_file.name}...")
+            with gzip.open(log_file, 'rt', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        record = json.loads(line)
+                        if record.get('type') in ('header', 'footer'):
+                            continue
+                        if 'problem' in record:
+                            seen.add(record['problem'])
+                    except json.JSONDecodeError:
+                        # Skip malformed lines
+                        continue
+        except EOFError:
+            # Gzip file was truncated (crash during write)
+            print(f"    Warning: {log_file.name} is truncated (crashed run?), skipping rest of file")
+            continue
+        except Exception as e:
+            # Any other error - skip this file
+            print(f"    Warning: Could not read {log_file.name}: {e}")
+            continue
     
     print(f"    Loaded {len(seen)} unique problems from {len(log_files)} log files")
     return seen
