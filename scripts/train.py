@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-RL training - task-agnostic GRPO pipeline.
+RL training - task-agnostic GRPO pipeline with full logging.
 
-The training script is completely task-agnostic. All task-specific logic
-(problem generation, answer extraction, reward computation) is handled
-by the generator class specified in CONFIG.
-
-Currently configured for arithmetic positive control.
-To switch to interleaving: change CONFIG['generator_class'].
+Features:
+- Dynamic problem generation (fresh problem each step)
+- Complete audit trail of all prompts/completions/rewards
+- Held-out validation against full training history
+- Task-agnostic via pluggable generators
 
 TESTED STACK (HuggingFace Cookbook, Dec 2025):
     trl==0.23.1, vllm==0.11.0, transformers==4.57.0
-
-OPTIMIZATIONS:
-    - Waits for vLLM AFTER DeepSpeed init (parallel model loading)
-    - Saves 6-8 minutes of startup time
 
 Usage (with vLLM server mode - recommended for 4x A40):
     # Terminal 1: Start vLLM server on GPU 3
@@ -24,11 +19,7 @@ Usage (with vLLM server mode - recommended for 4x A40):
     CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch \\
         --config_file accelerate_config.yaml \\
         --num_processes 3 \\
-        train.py --model meta-llama/Llama-3.1-8B-Instruct
-
-Usage (without vLLM - slower but simpler):
-    accelerate launch --config_file accelerate_config.yaml train.py \\
-        --model meta-llama/Llama-3.1-8B-Instruct --no-vllm
+        train.py --model meta-llama/Llama-3.1-8B-Instruct --dynamic-data
 """
 
 import argparse
@@ -41,7 +32,6 @@ from pathlib import Path
 from typing import Set, Optional
 
 # Set cache directories before importing HF libraries
-# This prevents filling up the root filesystem on Runpod
 if 'HF_HOME' not in os.environ:
     os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
 if 'PIP_CACHE_DIR' not in os.environ:
@@ -53,15 +43,19 @@ from datasets import Dataset
 from accelerate import PartialState
 import torch
 
-# Import utilities (task-agnostic only)
+# Import utilities
 from utils import build_prompt
 
 # Import generator infrastructure
 from generators.base import ProblemGenerator
 from problem_generator import ArithmeticGenerator
 
+# Import tracking and dynamic dataset
+from training_tracker import TrainingTracker, load_seen_problems
+from dynamic_dataset import SizedDynamicDataset
+
 # ============================================================================
-# CONFIG - User configurable settings
+# CONFIG
 # ============================================================================
 
 CONFIG = {
@@ -83,18 +77,18 @@ CONFIG = {
     'save_steps': 20,
     
     # GRPO specific
-    'beta': 0.0,  # KL penalty - 0.0 is standard (no ref model needed)
+    'beta': 0.0,
     
     # Paths
     'data_dir': 'data',
     'output_dir': '/workspace/checkpoints',
+    'log_dir': '/workspace/training_logs',
     
     # Dynamic data generation
-    'dataset_size': 2500,
-    'problem_config': {},  # Passed to generator
+    'dataset_size': 10000,  # Nominal size (actual is infinite)
+    'problem_config': {},
     
-    # === TASK SELECTION ===
-    # Change this to swap tasks (e.g., InterleaveGenerator)
+    # Task selection
     'generator_class': ArithmeticGenerator,
     
     # Validation
@@ -107,11 +101,7 @@ CONFIG = {
 # ============================================================================
 
 def wait_for_vllm(host: str = 'localhost', port: int = 8000, timeout: int = 1800, check_interval: int = 5):
-    """
-    Wait for vLLM server to be ready.
-    
-    Called AFTER DeepSpeed init to allow parallel model loading.
-    """
+    """Wait for vLLM server to be ready."""
     url = f"http://{host}:{port}/health"
     start = time.time()
     last_print = 0
@@ -135,36 +125,59 @@ def wait_for_vllm(host: str = 'localhost', port: int = 8000, timeout: int = 1800
 
 
 # ============================================================================
-# REWARD FUNCTION FACTORY
+# REWARD FUNCTION FACTORY (with logging)
 # ============================================================================
 
-def make_reward_fn(generator: ProblemGenerator):
+def make_reward_fn(generator: ProblemGenerator, tracker: TrainingTracker):
     """
-    Create reward function that uses the generator's task-specific logic.
+    Create reward function that logs everything to tracker.
     
-    This is a factory because GRPOTrainer expects a function, not a method.
-    The returned function closes over the generator instance.
+    The reward_fn is the interception point where we see:
+    - prompts (from dataset)
+    - completions (from model)
+    - answers (from dataset via kwargs)
+    - problems (from dataset via kwargs)
+    
+    We log all of this plus computed predictions and rewards.
     """
+    # Track step number (updated by callback)
+    step_counter = {'step': 0}
+    
     def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
         """
-        Compute rewards for completions.
-        
-        Delegates to generator.compute_reward() for task-specific logic.
+        Compute rewards and log all training examples.
         """
         rewards = []
         answers = kwargs.get('answer', [None] * len(prompts))
+        problems = kwargs.get('problem', [''] * len(prompts))
+        
+        predictions = []
         
         for completion, answer in zip(completions, answers):
             predicted = generator.extract_answer(completion)
+            predictions.append(predicted)
             
             if predicted is None:
-                # Log extraction failures for debugging
                 print(f"    Warning: Could not extract answer from: '{completion[:100]}'")
             
             reward = generator.compute_reward(predicted, answer)
             rewards.append(reward)
         
+        # Log everything to tracker
+        tracker.log_examples(
+            problems=problems,
+            prompts=prompts,
+            completions=completions,
+            answers=answers,
+            predictions=predictions,
+            rewards=rewards,
+            global_step=step_counter['step'],
+        )
+        
         return rewards
+    
+    # Expose step counter for callback to update
+    reward_fn.step_counter = step_counter
     
     return reward_fn
 
@@ -173,34 +186,30 @@ def make_reward_fn(generator: ProblemGenerator):
 # DATA LOADING
 # ============================================================================
 
-def prepare_dataset(tokenizer, args, config: dict, generator: ProblemGenerator) -> Dataset:
-    """Prepare dataset - static or dynamic based on flag."""
+def prepare_dataset(tokenizer, args, config: dict, generator: ProblemGenerator, state: PartialState) -> Dataset:
+    """Prepare dataset - static file or dynamic generation."""
     
-    # Get distributed state - only rank 0 should print
-    state = PartialState()
     is_main = state.is_main_process
-    
     system_message = generator.system_message
     
     if args.dynamic_data:
         if is_main:
-            print(f">>> Dynamic data mode - generating {config['dataset_size']} problems")
+            print(f">>> Dynamic data mode - fresh problems each step")
             print(f"    Task: {generator.task_name}")
+            print(f"    Nominal dataset size: {config['dataset_size']}")
         
-        problems = generator.generate_batch(
-            config['dataset_size'],
-            config.get('problem_config', {})
+        # Create dynamic dataset with rank-specific seed
+        dataset = SizedDynamicDataset(
+            generator=generator,
+            tokenizer=tokenizer,
+            config=config.get('problem_config', {}),
+            seed=42,
+            rank=state.process_index,
+            world_size=state.num_processes,
+            nominal_size=config['dataset_size'],
         )
         
-        data = {
-            'prompt': [build_prompt(p['problem'], tokenizer, system_message) for p in problems],
-            'problem': [p['problem'] for p in problems],
-            'answer': [p['answer'] for p in problems],
-        }
-        
-        if is_main:
-            print(f"    Generated {len(problems)} unique problems")
-        return Dataset.from_dict(data)
+        return dataset
     
     else:
         if is_main:
@@ -247,7 +256,6 @@ def cleanup_checkpoints(output_dir: Path):
     """Keep only: first, second-to-last, and last valid checkpoint."""
     checkpoints = get_checkpoints(output_dir)
     
-    # Remove invalid checkpoints first
     valid_checkpoints = []
     for step, path in checkpoints:
         if validate_checkpoint(path):
@@ -275,14 +283,12 @@ def validate_checkpoint(checkpoint_path: Path) -> bool:
         if not (checkpoint_path / f).exists():
             return False
     
-    # Check for model files
     has_model_files = any(
         checkpoint_path.glob('*.safetensors')
     ) or any(
         checkpoint_path.glob('*.bin')
     ) or (checkpoint_path / 'pytorch_model.bin').exists()
     
-    # For DeepSpeed, check for ZeRO checkpoint
     has_deepspeed = (checkpoint_path / 'zero_to_fp32.py').exists() or \
                     any(checkpoint_path.glob('global_step*'))
     
@@ -341,47 +347,73 @@ class RewardThresholdSaveCallback(TrainerCallback):
             control.should_save = True
 
 
+class StepCounterCallback(TrainerCallback):
+    """Update step counter for reward function logging."""
+    
+    def __init__(self, reward_fn):
+        self.reward_fn = reward_fn
+    
+    def on_step_begin(self, args, state, control, **kwargs):
+        self.reward_fn.step_counter['step'] = state.global_step
+
+
+class TrackerCallback(TrainerCallback):
+    """Manage tracker lifecycle (open/close log files)."""
+    
+    def __init__(self, tracker: TrainingTracker):
+        self.tracker = tracker
+    
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.tracker.open()
+        
+        # Load any previously seen problems (for resume)
+        log_dir = Path(self.tracker.output_dir)
+        if log_dir.exists() and any(log_dir.glob('training_log_*.jsonl.gz')):
+            prev_seen = load_seen_problems(log_dir)
+            self.tracker.seen_problems.update(prev_seen)
+            if state.is_world_process_zero:
+                print(f">>> Loaded {len(prev_seen)} previously seen problems")
+    
+    def on_train_end(self, args, state, control, **kwargs):
+        self.tracker.close()
+        
+        if state.is_world_process_zero:
+            stats = self.tracker.get_stats()
+            print(f">>> Training complete: {stats['total_examples']} examples logged, "
+                  f"{stats['unique_problems']} unique problems")
+
+
 class ValidationCallback(TrainerCallback):
     """
     Periodic validation on held-out set.
     
-    Uses generator methods for task-specific evaluation.
+    Uses tracker.seen_problems to ensure validation examples
+    haven't been seen during training.
     """
     
     def __init__(self, validation_size: int, validation_steps: int,
-                 generator: ProblemGenerator, tokenizer, config: dict):
+                 generator: ProblemGenerator, tokenizer, config: dict,
+                 tracker: TrainingTracker):
         self.validation_size = validation_size
         self.validation_steps = validation_steps
         self.generator = generator
         self.tokenizer = tokenizer
         self.config = config
-        self.seen_problems: Set[str] = set()
-        self.initialized = False
-    
-    def on_train_begin(self, args, state, control, **kwargs):
-        """Capture training problems to exclude from validation."""
-        trainer = kwargs.get('trainer', None)
-        if trainer and hasattr(trainer, 'train_dataset'):
-            dataset = trainer.train_dataset
-            if 'problem' in dataset.column_names:
-                for problem in dataset['problem']:
-                    self.seen_problems.add(problem)
-                print(f">>> Validation: Tracking {len(self.seen_problems)} seen problems")
-                self.initialized = True
+        self.tracker = tracker
     
     def on_step_end(self, args, state, control, **kwargs):
-        """Validate every N steps on held-out problems."""
         if state.global_step % self.validation_steps != 0:
             return
         if not state.is_world_process_zero:
             return
         
         print(f"\n>>> Validation at step {state.global_step}...")
+        print(f"    Training has seen {len(self.tracker.seen_problems)} unique problems")
         
-        # Generate held-out problems
+        # Generate held-out problems (not in training history)
         val_problems = self.generator.generate_held_out(
             self.validation_size,
-            self.seen_problems,
+            self.tracker.seen_problems,
             self.config.get('problem_config', {})
         )
         
@@ -389,7 +421,7 @@ class ValidationCallback(TrainerCallback):
             print("    Warning: Could not generate validation problems")
             return
         
-        # Get model and device
+        # Get model
         trainer = kwargs.get('trainer', None)
         if trainer is None or not hasattr(trainer, 'model'):
             print("    Warning: Cannot access model for validation")
@@ -450,6 +482,10 @@ def train(args):
         print(f"\nTask: {generator.task_name}")
         print(f"System message: {generator.system_message}")
     
+    # Create tracker (only main process writes)
+    log_dir = Path(CONFIG['log_dir'])
+    tracker = TrainingTracker(log_dir, is_main_process=is_main)
+    
     # Load tokenizer
     if is_main:
         print(f"\nLoading tokenizer: {args.model}")
@@ -461,9 +497,12 @@ def train(args):
     # Prepare dataset
     if is_main:
         print("\nPreparing dataset...")
-    train_dataset = prepare_dataset(tokenizer, args, CONFIG, generator)
+    train_dataset = prepare_dataset(tokenizer, args, CONFIG, generator, state)
     if is_main:
-        print(f"    Train: {len(train_dataset)} examples")
+        if hasattr(train_dataset, '__len__'):
+            print(f"    Dataset size: {len(train_dataset)} (nominal for dynamic)")
+        else:
+            print(f"    Dataset: infinite (dynamic generation)")
     
     # Output directory
     output_dir = Path(CONFIG['output_dir'])
@@ -492,30 +531,33 @@ def train(args):
         logging_steps=CONFIG['logging_steps'],
         save_steps=CONFIG['save_steps'],
         lr_scheduler_type='constant',
-        save_only_model=False,  # Required for DeepSpeed resume
+        save_only_model=False,
     )
     
-    # Create reward function using generator
-    reward_fn = make_reward_fn(generator)
+    # Create reward function with tracker
+    reward_fn = make_reward_fn(generator, tracker)
     
     # GRPO trainer
     if is_main:
         print("\nInitializing GRPO trainer...")
     grpo_trainer = GRPOTrainer(
         model=args.model,
-        processing_class=tokenizer,  # renamed from 'tokenizer' in TRL 0.23.x
+        processing_class=tokenizer,
         args=grpo_config,
         train_dataset=train_dataset,
-        reward_fn=reward_fn,
+        reward_funcs=reward_fn,  # renamed from 'reward_fn' in TRL 0.23.x
         callbacks=[
             RewardThresholdSaveCallback(),
             CheckpointCleanupCallback(output_dir),
+            StepCounterCallback(reward_fn),
+            TrackerCallback(tracker),
             ValidationCallback(
                 CONFIG['validation_size'],
                 CONFIG['validation_steps'],
                 generator,
                 tokenizer,
-                CONFIG
+                CONFIG,
+                tracker
             )
         ],
         resume_from_checkpoint=resume_from,
@@ -534,7 +576,8 @@ def train(args):
     
     if is_main:
         print("\nTraining complete!")
-        print(f"Checkpoints in {output_dir}")
+        print(f"Checkpoints: {output_dir}")
+        print(f"Training logs: {log_dir}")
 
 
 def main():
@@ -542,7 +585,7 @@ def main():
     parser.add_argument('--model', type=str, required=True, help='HuggingFace model name')
     parser.add_argument('--no-vllm', action='store_true', help='Disable vLLM server mode')
     parser.add_argument('--vllm-port', type=int, default=8000, help='vLLM server port')
-    parser.add_argument('--dynamic-data', action='store_true', help='Generate data dynamically')
+    parser.add_argument('--dynamic-data', action='store_true', help='Generate problems dynamically')
     args = parser.parse_args()
     
     train(args)
