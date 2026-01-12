@@ -50,6 +50,7 @@ if 'PIP_CACHE_DIR' not in os.environ:
 from transformers import AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from datasets import Dataset
+from accelerate import PartialState
 import torch
 
 # Import utilities (task-agnostic only)
@@ -175,11 +176,16 @@ def make_reward_fn(generator: ProblemGenerator):
 def prepare_dataset(tokenizer, args, config: dict, generator: ProblemGenerator) -> Dataset:
     """Prepare dataset - static or dynamic based on flag."""
     
+    # Get distributed state - only rank 0 should print
+    state = PartialState()
+    is_main = state.is_main_process
+    
     system_message = generator.system_message
     
     if args.dynamic_data:
-        print(f">>> Dynamic data mode - generating {config['dataset_size']} problems")
-        print(f"    Task: {generator.task_name}")
+        if is_main:
+            print(f">>> Dynamic data mode - generating {config['dataset_size']} problems")
+            print(f"    Task: {generator.task_name}")
         
         problems = generator.generate_batch(
             config['dataset_size'],
@@ -192,11 +198,13 @@ def prepare_dataset(tokenizer, args, config: dict, generator: ProblemGenerator) 
             'answer': [p['answer'] for p in problems],
         }
         
-        print(f"    Generated {len(problems)} unique problems")
+        if is_main:
+            print(f"    Generated {len(problems)} unique problems")
         return Dataset.from_dict(data)
     
     else:
-        print(">>> Static data mode - loading from file")
+        if is_main:
+            print(">>> Static data mode - loading from file")
         data_path = Path(config['data_dir']) / 'train.json'
         
         if not data_path.exists():
@@ -211,7 +219,8 @@ def prepare_dataset(tokenizer, args, config: dict, generator: ProblemGenerator) 
             'answer': [p['answer'] for p in problems],
         }
         
-        print(f"    Loaded {len(problems)} problems from {data_path}")
+        if is_main:
+            print(f"    Loaded {len(problems)} problems from {data_path}")
         return Dataset.from_dict(data)
 
 
@@ -425,27 +434,36 @@ class ValidationCallback(TrainerCallback):
 # ============================================================================
 
 def train(args):
-    print("=" * 70)
-    print("GRPO TRAINING - TASK-AGNOSTIC PIPELINE")
-    print("=" * 70)
+    # Get distributed state early
+    state = PartialState()
+    is_main = state.is_main_process
+    
+    if is_main:
+        print("=" * 70)
+        print("GRPO TRAINING - TASK-AGNOSTIC PIPELINE")
+        print("=" * 70)
     
     # Instantiate generator
     generator_class = CONFIG['generator_class']
     generator: ProblemGenerator = generator_class()
-    print(f"\nTask: {generator.task_name}")
-    print(f"System message: {generator.system_message}")
+    if is_main:
+        print(f"\nTask: {generator.task_name}")
+        print(f"System message: {generator.system_message}")
     
     # Load tokenizer
-    print(f"\nLoading tokenizer: {args.model}")
+    if is_main:
+        print(f"\nLoading tokenizer: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     
     # Prepare dataset
-    print("\nPreparing dataset...")
+    if is_main:
+        print("\nPreparing dataset...")
     train_dataset = prepare_dataset(tokenizer, args, CONFIG, generator)
-    print(f"    Train: {len(train_dataset)} examples")
+    if is_main:
+        print(f"    Train: {len(train_dataset)} examples")
     
     # Output directory
     output_dir = Path(CONFIG['output_dir'])
@@ -453,12 +471,13 @@ def train(args):
     
     # Check for checkpoint to resume
     resume_from = find_latest_checkpoint(output_dir)
-    if resume_from:
+    if resume_from and is_main:
         print(f"\n>>> Found checkpoint: {resume_from}")
         print("    Will resume training.")
     
     # GRPO config
-    print("\nConfiguring GRPO...")
+    if is_main:
+        print("\nConfiguring GRPO...")
     grpo_config = GRPOConfig(
         output_dir=str(output_dir),
         learning_rate=CONFIG['learning_rate'],
@@ -480,10 +499,11 @@ def train(args):
     reward_fn = make_reward_fn(generator)
     
     # GRPO trainer
-    print("\nInitializing GRPO trainer...")
+    if is_main:
+        print("\nInitializing GRPO trainer...")
     grpo_trainer = GRPOTrainer(
         model=args.model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,  # renamed from 'tokenizer' in TRL 0.23.x
         args=grpo_config,
         train_dataset=train_dataset,
         reward_fn=reward_fn,
@@ -503,15 +523,18 @@ def train(args):
     
     # Wait for vLLM if using it
     if not args.no_vllm:
-        print("\n>>> Trainer initialized, waiting for vLLM server...")
+        if is_main:
+            print("\n>>> Trainer initialized, waiting for vLLM server...")
         wait_for_vllm(host='localhost', port=args.vllm_port)
     
     # Train
-    print("\nStarting training...")
+    if is_main:
+        print("\nStarting training...")
     grpo_trainer.train()
     
-    print("\nTraining complete!")
-    print(f"Checkpoints in {output_dir}")
+    if is_main:
+        print("\nTraining complete!")
+        print(f"Checkpoints in {output_dir}")
 
 
 def main():
