@@ -92,6 +92,8 @@ else
     SKIP_INSTALL=0
 fi
 # After creating/activating venv
+# Set PYTHONPATH so scripts can find modules
+export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
 echo 'source /workspace/venv/bin/activate' >> ~/.bashrc
 # ============================================================================
 # INSTALL DEPENDENCIES WITH PINNED VERSIONS
