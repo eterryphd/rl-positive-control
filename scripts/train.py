@@ -560,7 +560,6 @@ def train(args):
                 tracker
             )
         ],
-        resume_from_checkpoint=resume_from,
     )
     
     # Wait for vLLM if using it
@@ -572,7 +571,7 @@ def train(args):
     # Train
     if is_main:
         print("\nStarting training...")
-    grpo_trainer.train()
+    grpo_trainer.train(resume_from_checkpoint=resume_from)
     
     if is_main:
         print("\nTraining complete!")
