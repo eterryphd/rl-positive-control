@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-RL training - arithmetic task using GRPO.
+RL training - task-agnostic GRPO pipeline.
 
-This is a positive control to validate the RL pipeline before
-applying to more complex tasks like interleaving.
+The training script is completely task-agnostic. All task-specific logic
+(problem generation, answer extraction, reward computation) is handled
+by the generator class specified in CONFIG.
+
+Currently configured for arithmetic positive control.
+To switch to interleaving: change CONFIG['generator_class'].
 
 TESTED STACK (HuggingFace Cookbook, Dec 2025):
     trl==0.23.1, vllm==0.11.0, transformers==4.57.0
@@ -17,19 +21,18 @@ Usage (with vLLM server mode - recommended for 4x A40):
     CUDA_VISIBLE_DEVICES=3 trl vllm-serve --model meta-llama/Llama-3.1-8B-Instruct
     
     # Terminal 2: Launch training on GPUs 0,1,2
-    CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch \
-        --config_file accelerate_config.yaml \
-        --num_processes 3 \
+    CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch \\
+        --config_file accelerate_config.yaml \\
+        --num_processes 3 \\
         train.py --model meta-llama/Llama-3.1-8B-Instruct
 
 Usage (without vLLM - slower but simpler):
-    accelerate launch --config_file accelerate_config.yaml train.py \
+    accelerate launch --config_file accelerate_config.yaml train.py \\
         --model meta-llama/Llama-3.1-8B-Instruct --no-vllm
 """
 
 import argparse
 import json
-import math
 import os
 import shutil
 import time
@@ -47,13 +50,12 @@ if 'PIP_CACHE_DIR' not in os.environ:
 from transformers import AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from datasets import Dataset
-import trl
 import torch
 
-# Import centralized utilities
-from utils import extract_answer, build_prompt, SYSTEM_MESSAGE
+# Import utilities (task-agnostic only)
+from utils import build_prompt
 
-# Import generator for dynamic data
+# Import generator infrastructure
 from generators.base import ProblemGenerator
 from problem_generator import ArithmeticGenerator
 
@@ -62,13 +64,13 @@ from problem_generator import ArithmeticGenerator
 # ============================================================================
 
 CONFIG = {
-    # Prompt configuration - system message centralized in utils.py
-    'max_new_tokens': 4096,  # Interleaved output needs ~1000 tokens + buffer
-    'max_prompt_length': 2048,  # Full texts + instructions ~1200 tokens
+    # Token limits - sized for interleave task to validate full pipeline
+    'max_new_tokens': 4096,
+    'max_prompt_length': 2048,
     
     # Generation
-    'temperature': 0.9,  # More diversity for reward variance
-    'num_generations': 6,  # More samples for GRPO signal
+    'temperature': 0.9,
+    'num_generations': 6,
     
     # Training - tuned for 4x A40 (48GB each)
     'learning_rate': 1e-6,
@@ -77,29 +79,30 @@ CONFIG = {
     'gradient_accumulation_steps': 8,
     'max_steps': 200,
     'logging_steps': 1,
-    # NOTE: save_steps set high - RewardThresholdSaveCallback handles saving
-    # based on reward threshold (>0.3) or new best
     'save_steps': 20,
     
     # GRPO specific
-    'beta': 0.0,  # KL penalty - 0.0 is now standard (no ref model needed)
+    'beta': 0.0,  # KL penalty - 0.0 is standard (no ref model needed)
     
     # Paths
     'data_dir': 'data',
     'output_dir': '/workspace/checkpoints',
     
     # Dynamic data generation
-    'dataset_size': 2500,  # Default size if dynamic mode enabled
-    'problem_config': {},  # Overrides for generator (e.g., custom ranges)
-    'generator_class': ArithmeticGenerator,  # Configurable for experiments
+    'dataset_size': 2500,
+    'problem_config': {},  # Passed to generator
+    
+    # === TASK SELECTION ===
+    # Change this to swap tasks (e.g., InterleaveGenerator)
+    'generator_class': ArithmeticGenerator,
     
     # Validation
-    'validation_size': 500,  # Number of held-out validation problems
-    'validation_steps': 20,  # Validate every N steps
+    'validation_size': 500,
+    'validation_steps': 20,
 }
 
 # ============================================================================
-# VLLM SERVER WAIT (for parallel loading optimization)
+# VLLM SERVER WAIT
 # ============================================================================
 
 def wait_for_vllm(host: str = 'localhost', port: int = 8000, timeout: int = 1800, check_interval: int = 5):
@@ -107,19 +110,6 @@ def wait_for_vllm(host: str = 'localhost', port: int = 8000, timeout: int = 1800
     Wait for vLLM server to be ready.
     
     Called AFTER DeepSpeed init to allow parallel model loading.
-    This saves 6-8 minutes compared to waiting before training starts.
-    
-    Args:
-        host: vLLM server host (default: localhost)
-        port: vLLM server port (default: 8000)
-        timeout: Maximum seconds to wait (default 30 min to handle slow compiles)
-        check_interval: Seconds between health checks
-    
-    Returns:
-        True if server is ready
-        
-    Raises:
-        RuntimeError if server not ready within timeout
     """
     url = f"http://{host}:{port}/health"
     start = time.time()
@@ -135,7 +125,6 @@ def wait_for_vllm(host: str = 'localhost', port: int = 8000, timeout: int = 1800
             return True
         except (urllib.error.URLError, urllib.error.HTTPError, OSError):
             elapsed = time.time() - start
-            # Print progress every 30 seconds
             if elapsed - last_print >= 30:
                 print(f"    Still waiting for vLLM... ({elapsed:.0f}s)")
                 last_print = elapsed
@@ -145,72 +134,60 @@ def wait_for_vllm(host: str = 'localhost', port: int = 8000, timeout: int = 1800
 
 
 # ============================================================================
-# REWARD FUNCTION
+# REWARD FUNCTION FACTORY
 # ============================================================================
 
-def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
+def make_reward_fn(generator: ProblemGenerator):
     """
-    Compute rewards for completions using continuous relative error.
+    Create reward function that uses the generator's task-specific logic.
     
-    Reward based on how close the answer is - exponential decay.
-    Perfect = +1.0, order of magnitude off approximately -0.3, way off to -1.0
-    
-    Args:
-        prompts: List of prompt strings
-        completions: List of completion strings (model outputs)
-        **kwargs: May contain 'answer' from dataset
-    
-    Returns:
-        List of reward floats in [-1, 1]
+    This is a factory because GRPOTrainer expects a function, not a method.
+    The returned function closes over the generator instance.
     """
-    rewards = []
-    answers = kwargs.get('answer', [None] * len(prompts))
-    
-    for i, (completion, answer) in enumerate(zip(completions, answers)):
-        predicted = extract_answer(completion)
+    def reward_fn(prompts: list, completions: list, **kwargs) -> list[float]:
+        """
+        Compute rewards for completions.
         
-        if predicted is None or answer is None:
-            # Log why extraction failed for debugging
+        Delegates to generator.compute_reward() for task-specific logic.
+        """
+        rewards = []
+        answers = kwargs.get('answer', [None] * len(prompts))
+        
+        for completion, answer in zip(completions, answers):
+            predicted = generator.extract_answer(completion)
+            
             if predicted is None:
+                # Log extraction failures for debugging
                 print(f"    Warning: Could not extract answer from: '{completion[:100]}'")
-            rewards.append(-1.0)
-            continue
+            
+            reward = generator.compute_reward(predicted, answer)
+            rewards.append(reward)
         
-        # Relative error (add 1 to denominator to handle answer=0)
-        relative_error = abs(predicted - answer) / (abs(answer) + 1)
-        
-        # Exponential decay: perfect=1.0, 10% off approximately 0.6, 50% off approximately 0.08
-        raw_reward = math.exp(-relative_error * 5)
-        
-        # Scale to [-1, 1]
-        reward = 2 * raw_reward - 1
-        
-        rewards.append(reward)
+        return rewards
     
-    return rewards
+    return reward_fn
 
 
 # ============================================================================
 # DATA LOADING
 # ============================================================================
 
-def prepare_dataset(tokenizer, args, config: dict) -> Dataset:
+def prepare_dataset(tokenizer, args, config: dict, generator: ProblemGenerator) -> Dataset:
     """Prepare dataset - static or dynamic based on flag."""
+    
+    system_message = generator.system_message
+    
     if args.dynamic_data:
-        print(">>> Dynamic data mode enabled - generating fresh dataset")
+        print(f">>> Dynamic data mode - generating {config['dataset_size']} problems")
+        print(f"    Task: {generator.task_name}")
         
-        # Instantiate generator from config
-        generator_class = config.get('generator_class', ArithmeticGenerator)
-        generator: ProblemGenerator = generator_class()
-        
-        # Generate fresh problems
         problems = generator.generate_batch(
             config['dataset_size'],
             config.get('problem_config', {})
         )
         
         data = {
-            'prompt': [build_prompt(p['problem'], tokenizer) for p in problems],
+            'prompt': [build_prompt(p['problem'], tokenizer, system_message) for p in problems],
             'problem': [p['problem'] for p in problems],
             'answer': [p['answer'] for p in problems],
         }
@@ -229,7 +206,7 @@ def prepare_dataset(tokenizer, args, config: dict) -> Dataset:
             problems = json.load(f)
         
         data = {
-            'prompt': [build_prompt(p['problem'], tokenizer) for p in problems],
+            'prompt': [build_prompt(p['problem'], tokenizer, system_message) for p in problems],
             'problem': [p['problem'] for p in problems],
             'answer': [p['answer'] for p in problems],
         }
@@ -258,10 +235,10 @@ def get_checkpoints(output_dir: Path) -> list:
 
 
 def cleanup_checkpoints(output_dir: Path):
-    """Keep only: first, second-to-last, and last valid checkpoint. Remove invalid ones."""
+    """Keep only: first, second-to-last, and last valid checkpoint."""
     checkpoints = get_checkpoints(output_dir)
     
-    # First, remove any invalid checkpoints
+    # Remove invalid checkpoints first
     valid_checkpoints = []
     for step, path in checkpoints:
         if validate_checkpoint(path):
@@ -283,15 +260,13 @@ def cleanup_checkpoints(output_dir: Path):
 
 def validate_checkpoint(checkpoint_path: Path) -> bool:
     """Check if checkpoint has all required files for resumption."""
-    required_files = [
-        'trainer_state.json',  # Training state
-    ]
+    required_files = ['trainer_state.json']
     
     for f in required_files:
         if not (checkpoint_path / f).exists():
             return False
     
-    # Check for at least one model/optimizer shard
+    # Check for model files
     has_model_files = any(
         checkpoint_path.glob('*.safetensors')
     ) or any(
@@ -309,7 +284,6 @@ def find_latest_checkpoint(output_dir: Path) -> Optional[str]:
     """Find latest valid checkpoint for resumption."""
     checkpoints = get_checkpoints(output_dir)
     
-    # Try checkpoints from newest to oldest
     for step, path in reversed(checkpoints):
         if validate_checkpoint(path):
             return str(path)
@@ -319,26 +293,23 @@ def find_latest_checkpoint(output_dir: Path) -> Optional[str]:
     return None
 
 
+# ============================================================================
+# CALLBACKS
+# ============================================================================
+
 class CheckpointCleanupCallback(TrainerCallback):
-    """Clean up old checkpoints after each save. Only runs on main process."""
+    """Clean up old checkpoints after each save."""
     
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
     
     def on_save(self, args, state, control, **kwargs):
-        """Called after checkpoint is saved."""
-        # Only run cleanup on main process to avoid race conditions
         if state.is_world_process_zero:
             cleanup_checkpoints(self.output_dir)
 
 
 class RewardThresholdSaveCallback(TrainerCallback):
-    """
-    Only save checkpoints when reward exceeds threshold or is new best.
-    
-    This prevents filling disk with mediocre checkpoints while ensuring
-    we capture good training states.
-    """
+    """Save checkpoints when reward exceeds threshold or is new best."""
     
     def __init__(self, threshold: float = 0.3):
         self.threshold = threshold
@@ -352,7 +323,6 @@ class RewardThresholdSaveCallback(TrainerCallback):
         if reward is None:
             return
         
-        # Save if above threshold OR new best
         if reward > self.threshold or reward > self.best_reward:
             if reward > self.best_reward:
                 self.best_reward = reward
@@ -366,11 +336,10 @@ class ValidationCallback(TrainerCallback):
     """
     Periodic validation on held-out set.
     
-    FIXED: Now properly tracks seen problems during training and generates
-    held-out validation problems that haven't been seen before.
+    Uses generator methods for task-specific evaluation.
     """
     
-    def __init__(self, validation_size: int, validation_steps: int, 
+    def __init__(self, validation_size: int, validation_steps: int,
                  generator: ProblemGenerator, tokenizer, config: dict):
         self.validation_size = validation_size
         self.validation_steps = validation_steps
@@ -378,12 +347,10 @@ class ValidationCallback(TrainerCallback):
         self.tokenizer = tokenizer
         self.config = config
         self.seen_problems: Set[str] = set()
-        # Track which problems appear in the training dataset
         self.initialized = False
     
     def on_train_begin(self, args, state, control, **kwargs):
-        """Capture initial training dataset problems."""
-        # Get access to the training dataset from trainer
+        """Capture training problems to exclude from validation."""
         trainer = kwargs.get('trainer', None)
         if trainer and hasattr(trainer, 'train_dataset'):
             dataset = trainer.train_dataset
@@ -395,58 +362,62 @@ class ValidationCallback(TrainerCallback):
     
     def on_step_end(self, args, state, control, **kwargs):
         """Validate every N steps on held-out problems."""
-        if state.global_step % self.validation_steps == 0 and state.is_world_process_zero:
-            print(f"\n    Validating at step {state.global_step}...")
-            
-            # Generate held-out validation set (problems not in training)
-            val_problems = self.generator.generate_held_out(
-                self.validation_size,
-                self.seen_problems,
-                self.config.get('problem_config', {})
-            )
-            
-            if not val_problems:
-                print("    Warning: Could not generate validation problems")
-                return
-            
-            # Prepare validation dataset
-            val_data = {
-                'prompt': [build_prompt(p['problem'], self.tokenizer) for p in val_problems],
-                'answer': [p['answer'] for p in val_problems],
-            }
-            val_dataset = Dataset.from_dict(val_data)
-            
-            # Evaluate - generate completions and compute accuracy
-            trainer = kwargs.get('trainer', None)
-            if trainer is None or not hasattr(trainer, 'model'):
-                print("    Warning: Cannot access model for validation")
-                return
-            
-            model = trainer.model
-            device = model.device if hasattr(model, 'device') else 'cuda'
-            
-            correct = 0
-            for i in range(len(val_dataset)):
-                try:
-                    inputs = self.tokenizer(val_dataset['prompt'][i], return_tensors="pt").to(device)
-                    with torch.no_grad():
-                        outputs = model.generate(
-                            **inputs,
-                            max_new_tokens=CONFIG['max_new_tokens'],
-                            do_sample=False,
-                            pad_token_id=self.tokenizer.eos_token_id,
-                        )
-                    generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
-                    response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-                    predicted = extract_answer(response)
-                    if predicted is not None and abs(predicted - val_dataset['answer'][i]) < 0.01:
-                        correct += 1
-                except Exception as e:
-                    print(f"      Error evaluating problem {i}: {e}")
-                    continue
-            
-            accuracy = correct / len(val_problems) if val_problems else 0
-            print(f"    Validation accuracy: {accuracy:.1%} ({correct}/{len(val_problems)})")
+        if state.global_step % self.validation_steps != 0:
+            return
+        if not state.is_world_process_zero:
+            return
+        
+        print(f"\n>>> Validation at step {state.global_step}...")
+        
+        # Generate held-out problems
+        val_problems = self.generator.generate_held_out(
+            self.validation_size,
+            self.seen_problems,
+            self.config.get('problem_config', {})
+        )
+        
+        if not val_problems:
+            print("    Warning: Could not generate validation problems")
+            return
+        
+        # Get model and device
+        trainer = kwargs.get('trainer', None)
+        if trainer is None or not hasattr(trainer, 'model'):
+            print("    Warning: Cannot access model for validation")
+            return
+        
+        model = trainer.model
+        device = model.device if hasattr(model, 'device') else 'cuda'
+        system_message = self.generator.system_message
+        
+        # Evaluate
+        correct = 0
+        for problem in val_problems:
+            try:
+                prompt = build_prompt(problem['problem'], self.tokenizer, system_message)
+                inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
+                
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=self.config['max_new_tokens'],
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                    )
+                
+                generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
+                response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                
+                predicted = self.generator.extract_answer(response)
+                if self.generator.check_correct(predicted, problem['answer']):
+                    correct += 1
+                    
+            except Exception as e:
+                print(f"    Error evaluating: {e}")
+                continue
+        
+        accuracy = correct / len(val_problems) if val_problems else 0
+        print(f"    Accuracy: {accuracy:.1%} ({correct}/{len(val_problems)})")
 
 
 # ============================================================================
@@ -455,58 +426,58 @@ class ValidationCallback(TrainerCallback):
 
 def train(args):
     print("=" * 70)
-    print("GRPO TRAINING - ARITHMETIC POSITIVE CONTROL")
+    print("GRPO TRAINING - TASK-AGNOSTIC PIPELINE")
     print("=" * 70)
+    
+    # Instantiate generator
+    generator_class = CONFIG['generator_class']
+    generator: ProblemGenerator = generator_class()
+    print(f"\nTask: {generator.task_name}")
+    print(f"System message: {generator.system_message}")
     
     # Load tokenizer
     print(f"\nLoading tokenizer: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"  # Required for GRPO
+    tokenizer.padding_side = "left"
     
     # Prepare dataset
-    print("Preparing dataset...")
-    train_dataset = prepare_dataset(tokenizer, args, CONFIG)
+    print("\nPreparing dataset...")
+    train_dataset = prepare_dataset(tokenizer, args, CONFIG, generator)
     print(f"    Train: {len(train_dataset)} examples")
     
-    # Create output directory
+    # Output directory
     output_dir = Path(CONFIG['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Check for existing checkpoint to resume from
+    # Check for checkpoint to resume
     resume_from = find_latest_checkpoint(output_dir)
     if resume_from:
-        print(f"\n>>> Found existing checkpoint: {resume_from}")
-        print("    Will resume training from this checkpoint.")
+        print(f"\n>>> Found checkpoint: {resume_from}")
+        print("    Will resume training.")
     
-    # GRPO config - with proper multi-GPU settings
+    # GRPO config
     print("\nConfiguring GRPO...")
+    grpo_config = GRPOConfig(
+        output_dir=str(output_dir),
+        learning_rate=CONFIG['learning_rate'],
+        num_train_epochs=CONFIG['num_train_epochs'],
+        per_device_train_batch_size=CONFIG['per_device_train_batch_size'],
+        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
+        num_generations=CONFIG['num_generations'],
+        max_completion_length=CONFIG['max_new_tokens'],
+        max_prompt_length=CONFIG['max_prompt_length'],
+        temperature=CONFIG['temperature'],
+        max_steps=CONFIG['max_steps'],
+        logging_steps=CONFIG['logging_steps'],
+        save_steps=CONFIG['save_steps'],
+        lr_scheduler_type='constant',
+        save_only_model=False,  # Required for DeepSpeed resume
+    )
     
-    grpo_kwargs = {
-        'output_dir': str(output_dir),
-        'learning_rate': CONFIG['learning_rate'],
-        'num_train_epochs': CONFIG['num_train_epochs'],
-        'per_device_train_batch_size': CONFIG['per_device_train_batch_size'],
-        'gradient_accumulation_steps': CONFIG['gradient_accumulation_steps'],
-        'num_generations': CONFIG['num_generations'],
-        'max_completion_length': CONFIG['max_new_tokens'],
-        'max_prompt_length': CONFIG['max_prompt_length'],
-        'temperature': CONFIG['temperature'],  # Diversity for reward variance
-        'max_steps': CONFIG['max_steps'],
-        'logging_steps': CONFIG['logging_steps'],
-        'save_steps': CONFIG['save_steps'],
-        'lr_scheduler_type': 'constant',  # No decay - let Adam handle adaptation
-        # Keeping all checkpoints - identify best by validation later
-        # NOTE: save_only_model=False required for DeepSpeed resume on spot pods
-        'save_only_model': False,
-    }
-    
-    grpo_config = GRPOConfig(**grpo_kwargs)
-    
-    # Instantiate generator for validation
-    generator_class = CONFIG.get('generator_class', ArithmeticGenerator)
-    generator = generator_class()
+    # Create reward function using generator
+    reward_fn = make_reward_fn(generator)
     
     # GRPO trainer
     print("\nInitializing GRPO trainer...")
@@ -532,7 +503,7 @@ def train(args):
     
     # Wait for vLLM if using it
     if not args.no_vllm:
-        print("\n>>> Trainer initialized, now waiting for vLLM server...")
+        print("\n>>> Trainer initialized, waiting for vLLM server...")
         wait_for_vllm(host='localhost', port=args.vllm_port)
     
     # Train
@@ -540,7 +511,7 @@ def train(args):
     grpo_trainer.train()
     
     print("\nTraining complete!")
-    print(f"Final checkpoints in {output_dir}")
+    print(f"Checkpoints in {output_dir}")
 
 
 def main():
@@ -548,7 +519,7 @@ def main():
     parser.add_argument('--model', type=str, required=True, help='HuggingFace model name')
     parser.add_argument('--no-vllm', action='store_true', help='Disable vLLM server mode')
     parser.add_argument('--vllm-port', type=int, default=8000, help='vLLM server port')
-    parser.add_argument('--dynamic-data', action='store_true', help='Enable dynamic data generation')
+    parser.add_argument('--dynamic-data', action='store_true', help='Generate data dynamically')
     args = parser.parse_args()
     
     train(args)

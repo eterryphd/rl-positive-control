@@ -1,47 +1,29 @@
 # scripts/utils.py
-import re
-from typing import Optional
+"""
+Shared utilities for RL training pipeline.
 
-# Centralized system message
-SYSTEM_MESSAGE = "You are a calculator. Output only the number."
+This module contains ONLY task-agnostic utilities.
+All task-specific logic (answer extraction, rewards, system messages)
+lives in the generator classes.
+"""
 
-def extract_answer(response: str) -> Optional[float]:
+from typing import Any
+
+
+def build_prompt(problem: str, tokenizer, system_message: str) -> str:
     """
-    Extracts the first numeric value from the model response, handling formatting issues like commas.
+    Build a chat-formatted prompt for the given problem.
     
     Args:
-        response (str): The raw model output.
+        problem: The problem string (becomes user message).
+        tokenizer: HuggingFace tokenizer with chat template support.
+        system_message: Task-specific system prompt (from generator).
     
     Returns:
-        Optional[float]: The extracted number as a float, or None if no valid number is found.
-    """
-    # Remove commas to handle thousands separators
-    response = response.replace(',', '')
-    
-    # Find the first number (supports negatives and decimals)
-    numbers = re.findall(r'-?\d+\.?\d*', response)
-    
-    if numbers:
-        try:
-            return float(numbers[0])
-        except ValueError:
-            return None
-    
-    return None
-
-def build_prompt(problem: str, tokenizer) -> str:
-    """
-    Builds a chat-formatted prompt for the given problem using the centralized system message.
-    
-    Args:
-        problem (str): The arithmetic problem string.
-        tokenizer: The tokenizer object for applying chat template.
-    
-    Returns:
-        str: The formatted prompt.
+        Formatted prompt string ready for model input.
     """
     messages = [
-        {"role": "system", "content": SYSTEM_MESSAGE},
+        {"role": "system", "content": system_message},
         {"role": "user", "content": problem}
     ]
     return tokenizer.apply_chat_template(
@@ -49,3 +31,10 @@ def build_prompt(problem: str, tokenizer) -> str:
         tokenize=False,
         add_generation_prompt=True
     )
+
+
+def truncate_string(s: str, max_len: int = 100, suffix: str = "...") -> str:
+    """Truncate string with suffix if too long."""
+    if len(s) <= max_len:
+        return s
+    return s[:max_len - len(suffix)] + suffix
