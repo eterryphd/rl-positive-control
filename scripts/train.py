@@ -148,6 +148,18 @@ def make_reward_fn(generator: ProblemGenerator, tracker: TrainingTracker):
         """
         Compute rewards and log all training examples.
         """
+        # DEBUG: Print what we're receiving
+        if step_counter['step'] == 0:
+            print(f"\n>>> DEBUG reward_fn called:")
+            print(f"    prompts type: {type(prompts)}, len: {len(prompts)}")
+            print(f"    completions type: {type(completions)}, len: {len(completions)}")
+            if completions:
+                print(f"    completions[0] type: {type(completions[0])}")
+                print(f"    completions[0][:200]: {str(completions[0])[:200]}")
+            print(f"    kwargs keys: {list(kwargs.keys())}")
+            for k, v in kwargs.items():
+                print(f"    kwargs[{k}] type: {type(v)}, len: {len(v) if hasattr(v, '__len__') else 'N/A'}")
+        
         rewards = []
         answers = kwargs.get('answer', [None] * len(prompts))
         problems = kwargs.get('problem', [''] * len(prompts))
@@ -155,11 +167,17 @@ def make_reward_fn(generator: ProblemGenerator, tracker: TrainingTracker):
         predictions = []
         
         for completion, answer in zip(completions, answers):
+            # Handle if completion is a list (multi-turn) or dict
+            if isinstance(completion, list):
+                completion = completion[-1] if completion else ""
+            if isinstance(completion, dict):
+                completion = completion.get('content', str(completion))
+            
             predicted = generator.extract_answer(completion)
             predictions.append(predicted)
             
             if predicted is None:
-                print(f"    Warning: Could not extract answer from: '{completion[:100]}'")
+                print(f"    Warning: Could not extract answer from: '{str(completion)[:100]}'")
             
             reward = generator.compute_reward(predicted, answer)
             rewards.append(reward)
@@ -168,7 +186,7 @@ def make_reward_fn(generator: ProblemGenerator, tracker: TrainingTracker):
         tracker.log_examples(
             problems=problems,
             prompts=prompts,
-            completions=completions,
+            completions=[str(c) for c in completions],  # Ensure strings
             answers=answers,
             predictions=predictions,
             rewards=rewards,

@@ -80,6 +80,7 @@ class TrainingTracker:
         self.lock = Lock()
         self.total_examples = 0
         self.current_step = 0
+        print(f">>> DEBUG TrainingTracker init: is_main_process={is_main_process}")
         
     def open(self):
         """Open log file for writing."""
@@ -149,6 +150,12 @@ class TrainingTracker:
             rewards: Computed rewards
             global_step: Current training step
         """
+        # DEBUG
+        if global_step == 0:
+            print(f">>> DEBUG log_examples called: is_main={self.is_main_process}, file={self.log_file is not None}")
+            print(f"    problems[0] if any: {problems[0] if problems else 'EMPTY'}")
+            print(f"    len(problems): {len(problems)}")
+        
         timestamp = datetime.now().isoformat()
         self.current_step = global_step
         
@@ -174,8 +181,8 @@ class TrainingTracker:
                     self.log_file.write(json.dumps(example.to_dict()) + '\n')
                     self.total_examples += 1
             
-            # Flush periodically
-            if self.is_main_process and self.log_file is not None and self.total_examples % 100 == 0:
+            # Flush after every write for debugging
+            if self.is_main_process and self.log_file is not None:
                 self.log_file.flush()
     
     def get_stats(self) -> Dict:
